@@ -11,8 +11,8 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
 MIN_PRICE = 50.0
 MAX_PRICE = 200.0
-MAX_MA_DIST_PCT = 0.40  # Max distance between 20 SMA & 200 SMA (%)
-MAX_ATR_PCT = 0.25      # Max 14-period ATR (%)
+MAX_MA_DIST_PCT = 0.80  # Max distance between 20 SMA & 200 SMA (%)
+MAX_ATR_PCT = 0.50      # Max 14-period ATR (%)
 
 def send_to_discord(caption, photo_path=None):
     if not DISCORD_WEBHOOK_URL:
@@ -80,7 +80,8 @@ def scan_ticker(ticker):
 
         narrow_mask = (ma_dist_pct <= MAX_MA_DIST_PCT) & (atr_pct <= MAX_ATR_PCT)
 
-        if narrow_mask.iloc[-15:].any():
+        # Check if Narrow State occurred in the last 60 two-minute bars (last 2 hours of session)
+        if narrow_mask.iloc[-60:].any():
             chart_file = generate_chart(ticker, df)
             return {
                 "Ticker": ticker,
@@ -94,7 +95,7 @@ def scan_ticker(ticker):
 
 def main():
     tickers = get_tickers()
-    send_to_discord("🔍 **Starting Daily Post-Market Narrow State Scan...**")
+    send_to_discord(f"🔍 **Starting Daily Post-Market Narrow State Scan ({len(tickers)} stocks)...**")
 
     results = []
     with ThreadPoolExecutor(max_workers=10) as executor:
@@ -107,6 +108,8 @@ def main():
         for item in results:
             caption = f"📊 **{item['Ticker']}** | Price: ${item['Price']} | 20/200 SMA Dist: {item['MA_Dist_%']}%"
             send_to_discord(caption, item['Chart'])
+            if os.path.exists(item['Chart']):
+                os.remove(item['Chart'])
     else:
         send_to_discord("ℹ️ No stocks met the Narrow State criteria today.")
 
