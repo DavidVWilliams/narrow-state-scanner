@@ -11,7 +11,7 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
 MIN_PRICE = 50.0
 MAX_PRICE = 200.0
-MAX_MA_DIST_PCT = 0.80  # Max distance between 20 SMA & 200 SMA (%)
+MAX_MA_DIST_PCT = 1.0   # Max % distance between 20 SMA & 200 SMA
 MAX_ATR_PCT = 0.50      # Max 14-period ATR (%)
 
 def send_to_discord(caption, photo_path=None):
@@ -28,7 +28,10 @@ def send_to_discord(caption, photo_path=None):
         requests.post(DISCORD_WEBHOOK_URL, json={"content": caption})
 
 def generate_chart(ticker, df):
-    chart_data = df.tail(100).copy()
+    # Take the last 120 candles (2-minute timeframe)
+    chart_data = df.tail(120).copy()
+    
+    # Calculate SMAs on the slice for plotting
     sma20 = chart_data['Close'].rolling(20).mean()
     sma200 = chart_data['Close'].rolling(200).mean()
 
@@ -58,8 +61,9 @@ def get_tickers():
 
 def scan_ticker(ticker):
     try:
-        df = yf.download(ticker, period="1d", interval="2m", progress=False)
-        if df.empty or len(df) < 50:
+        # Download 5 days of 2-minute candles so 200 SMA can calculate properly
+        df = yf.download(ticker, period="5d", interval="2m", progress=False)
+        if df.empty or len(df) < 200:
             return None
 
         close = df['Close'].squeeze()
@@ -70,8 +74,11 @@ def scan_ticker(ticker):
         if not (MIN_PRICE <= latest_price <= MAX_PRICE):
             return None
 
+        # 20 SMA and 200 SMA calculations
         sma20 = close.rolling(20).mean()
         sma200 = close.rolling(200).mean()
+
+        # ATR calculation
         tr = np.maximum(high - low, np.maximum(abs(high - close.shift(1)), abs(low - close.shift(1))))
         atr14 = tr.rolling(14).mean()
 
@@ -80,7 +87,7 @@ def scan_ticker(ticker):
 
         narrow_mask = (ma_dist_pct <= MAX_MA_DIST_PCT) & (atr_pct <= MAX_ATR_PCT)
 
-        # Check if Narrow State occurred in the last 60 two-minute bars (last 2 hours of session)
+        # Check if Narrow State occurred in the last 60 two-minute bars today
         if narrow_mask.iloc[-60:].any():
             chart_file = generate_chart(ticker, df)
             return {
