@@ -19,19 +19,19 @@ def send_to_discord(caption, photo_path=None):
         print("No DISCORD_WEBHOOK_URL set. Skipping notification.")
         return
     
-    if photo_path and os.path.exists(photo_path):
-        with open(photo_path, "rb") as photo:
-            files = {"file": (photo_path, photo, "image/png")}
-            payload = {"content": caption}
-            requests.post(DISCORD_WEBHOOK_URL, data=payload, files=files)
-    else:
-        requests.post(DISCORD_WEBHOOK_URL, json={"content": caption})
+    try:
+        if photo_path and os.path.exists(photo_path):
+            with open(photo_path, "rb") as photo:
+                files = {"file": (photo_path, photo, "image/png")}
+                payload = {"content": caption}
+                requests.post(DISCORD_WEBHOOK_URL, data=payload, files=files)
+        else:
+            requests.post(DISCORD_WEBHOOK_URL, json={"content": caption})
+    except Exception as e:
+        print(f"Error sending to Discord: {e}")
 
 def generate_chart(ticker, df):
-    # Take the last 120 candles (2-minute timeframe)
     chart_data = df.tail(120).copy()
-    
-    # Calculate SMAs on the slice for plotting
     sma20 = chart_data['Close'].rolling(20).mean()
     sma200 = chart_data['Close'].rolling(200).mean()
 
@@ -61,24 +61,23 @@ def get_tickers():
 
 def scan_ticker(ticker):
     try:
-        # Download 5 days of 2-minute candles so 200 SMA can calculate properly
-        df = yf.download(ticker, period="5d", interval="2m", progress=False)
+        # yf.Ticker().history() provides clean 1D Series columns
+        t_obj = yf.Ticker(ticker)
+        df = t_obj.history(period="5d", interval="2m")
         if df.empty or len(df) < 200:
             return None
 
-        close = df['Close'].squeeze()
-        high = df['High'].squeeze()
-        low = df['Low'].squeeze()
+        close = df['Close']
+        high = df['High']
+        low = df['Low']
 
         latest_price = float(close.iloc[-1])
         if not (MIN_PRICE <= latest_price <= MAX_PRICE):
             return None
 
-        # 20 SMA and 200 SMA calculations
         sma20 = close.rolling(20).mean()
         sma200 = close.rolling(200).mean()
 
-        # ATR calculation
         tr = np.maximum(high - low, np.maximum(abs(high - close.shift(1)), abs(low - close.shift(1))))
         atr14 = tr.rolling(14).mean()
 
@@ -87,8 +86,8 @@ def scan_ticker(ticker):
 
         narrow_mask = (ma_dist_pct <= MAX_MA_DIST_PCT) & (atr_pct <= MAX_ATR_PCT)
 
-        # Check if Narrow State occurred in the last 60 two-minute bars today
-        if narrow_mask.iloc[-60:].any():
+        # Check if Narrow State condition occurred in recent bars
+        if bool(narrow_mask.iloc[-60:].any()):
             chart_file = generate_chart(ticker, df)
             return {
                 "Ticker": ticker,
@@ -96,7 +95,8 @@ def scan_ticker(ticker):
                 "MA_Dist_%": round(float(ma_dist_pct.iloc[-1]), 3),
                 "Chart": chart_file
             }
-    except Exception:
+    except Exception as e:
+        print(f"Error scanning {ticker}: {e}")
         return None
     return None
 
