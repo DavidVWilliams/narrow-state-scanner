@@ -18,7 +18,7 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
 # --- Scan Settings ---
 MIN_PRICE = 50.0
-MAX_PRICE = 400.0             # Max price $400.00
+MAX_PRICE = 350.0             # Max price $350.00
 MIN_DAILY_VOLUME = 2_000_000  # Minimum 2 Million shares average daily volume
 MIN_DOLLAR_VOLUME = 500_000_000 # Minimum $500 Million daily turnover
 MIN_DAILY_ATR = 1.50          # Minimum Daily ATR of $1.50
