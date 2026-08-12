@@ -18,10 +18,16 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
 # --- Scan Settings ---
 MIN_PRICE = 50.0
-MAX_PRICE = 200.0
-MIN_DAILY_VOLUME = 2_000_000       # Minimum 2 Million shares average daily volume
-MIN_DOLLAR_VOLUME = 500_000_000    # Minimum $500 Million daily dollar volume (Prioritizes Leaders like PLTR/DIS)
-TOP_COUNT = 10                     # Deliver Top 10 candidates
+MAX_PRICE = 400.0             # Max price increased to $400.00
+MIN_DAILY_VOLUME = 2_000_000  # Minimum 2 Million shares average daily volume
+MIN_DOLLAR_VOLUME = 500_000_000 # Minimum $500 Million daily turnover
+MIN_DAILY_ATR = 1.50          # Minimum Daily ATR of $1.50
+TOP_COUNT = 10                # Deliver Top 10 candidates
+
+# --- Strict Pinning & Flatness Rules ---
+MAX_200_SLOPE_PCT = 0.08      # 200 SMA must be flat (max 0.08% slope over last 30 bars)
+MAX_CLOSING_MA_GAP = 0.08     # 20 SMA & 200 SMA must be within 0.08% at close
+MAX_PRICE_200_GAP = 0.15      # Close price must be within 0.15% of 200 SMA
 
 def send_to_discord(caption, photo_path=None):
     if not DISCORD_WEBHOOK_URL:
@@ -92,26 +98,37 @@ def get_tickers():
         df_sp = pd.read_csv(url)
         sp_tickers = df_sp['Symbol'].tolist()
         
-        extra_tickers = ["PLTR", "DIS", "QQQ", "SPY", "IWM", "TSLA", "NVDA", "AMD", "AMZN", "META", "GOOGL", "AAPL", "MSFT", "SOFI", "HOOD", "UBER", "ABNB", "COIN", "MARA", "RIOT", "DKNG", "SNAP", "SQ", "SHOP", "RBLX", "PALO"]
+        extra_tickers = ["DIS", "QQQ", "SPY", "IWM", "TSLA", "NVDA", "AMD", "AMZN", "META", "GOOGL", "AAPL", "MSFT", "PLTR", "SOFI", "HOOD", "UBER", "ABNB", "COIN", "MARA", "RIOT", "DKNG", "SNAP", "SQ", "SHOP", "RBLX", "PALO"]
         
         all_tickers = list(set(sp_tickers + extra_tickers))
         return [t.replace('.', '-') for t in all_tickers]
     except Exception as e:
         print(f"Error fetching tickers: {e}")
-        return ["PLTR", "DIS", "AMD", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "INTC", "PYPL", "QCOM"]
+        return ["DIS", "AMD", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "INTC", "PYPL", "QCOM"]
 
 def scan_ticker(ticker):
     try:
         t_obj = yf.Ticker(ticker)
-        # 7d ensures len(df) is never under 200 bars; prepost=False keeps 9:30 AM - 4:00 PM ET
+        
+        # 1. Check Daily ATR (Must be >= $1.50)
+        df_daily = t_obj.history(period="1mo", interval="1d")
+        if df_daily.empty or len(df_daily) < 14:
+            return None
+            
+        d_tr = np.maximum(
+            df_daily['High'] - df_daily['Low'],
+            np.maximum(abs(df_daily['High'] - df_daily['Close'].shift(1)), abs(df_daily['Low'] - df_daily['Close'].shift(1)))
+        )
+        daily_atr = float(d_tr.rolling(14).mean().iloc[-1])
+        if daily_atr < MIN_DAILY_ATR:
+            return None
+
+        # 2. Download 2-minute intraday data (Regular Trading Hours only)
         df = t_obj.history(period="7d", interval="2m", prepost=False)
-        if df.empty or len(df) < 50:
+        if df.empty or len(df) < 200:
             return None
 
         close = df['Close']
-        high = df['High']
-        low = df['Low']
-        open_p = df['Open']
         volume = df['Volume']
 
         latest_price = float(close.iloc[-1])
@@ -122,7 +139,6 @@ def scan_ticker(ticker):
         if avg_daily_volume < MIN_DAILY_VOLUME:
             return None
 
-        # Filter by Dollar Volume ($500M+ daily turnover) to prioritize active leaders like PLTR/DIS
         avg_dollar_volume = latest_price * avg_daily_volume
         if avg_dollar_volume < MIN_DOLLAR_VOLUME:
             return None
@@ -132,47 +148,39 @@ def scan_ticker(ticker):
 
         ma_dist_pct = (abs(sma20 - sma200) / close) * 100.0
 
-        # 1. 200 SMA Slope over last 30 bars (Must be flat: <= 0.08%)
+        # 200 SMA Slope over last 30 bars (Must be flat: <= 0.08%)
         sma200_slope = float(abs(sma200.iloc[-1] - sma200.iloc[-30]) / latest_price * 100)
-        if sma200_slope > 0.08:
+        if sma200_slope > MAX_200_SLOPE_PCT:
             return None
 
-        # 2. 20 SMA Slope over last 15 bars
+        # 20 SMA & 200 SMA Gap at close (last 5 bars / 10 mins: <= 0.08%)
+        closing_ma_gap = float(ma_dist_pct.iloc[-5:].mean())
+        if closing_ma_gap > MAX_CLOSING_MA_GAP:
+            return None
+
+        # Final Closing Price MUST be pinned within 0.15% of 200 SMA
+        price_to_200_gap = float(abs(latest_price - sma200.iloc[-1]) / latest_price * 100)
+        if price_to_200_gap > MAX_PRICE_200_GAP:
+            return None
+
         sma20_slope = float(abs(sma20.iloc[-1] - sma20.iloc[-15]) / latest_price * 100)
 
-        # 3. Gap measurements at close
-        closing_ma_gap = float(ma_dist_pct.iloc[-10:].mean())
-        price_to_200_gap = float(abs(latest_price - sma200.iloc[-1]) / latest_price * 100)
-
-        # 4. Candle body range in final 15 minutes
-        body_high = np.maximum(open_p, close)
-        body_low = np.minimum(open_p, close)
-        closing_body_box = float((body_high.iloc[-8:].max() - body_low.iloc[-8:].min()) / latest_price * 100)
-
-        # Baseline Proximity filter
-        if closing_ma_gap > 0.25 or price_to_200_gap > 0.35:
-            return None
-
         is_flat_20 = sma20_slope <= 0.08
-        is_pinned_ma = closing_ma_gap <= 0.08
 
-        if is_flat_20 and is_pinned_ma:
+        if is_flat_20:
             tier_num = 1
-            tier_label = "🔥 Tier 1: Perfect Flat 200 & 20 Pin (Best)"
-        elif is_pinned_ma:
-            tier_num = 2
-            tier_label = "⚡ Tier 2: Flat 200 Magnet Pin (OK)"
+            tier_label = "🔥 Tier 1: Perfect Flat 200 & 20 Pin"
         else:
-            tier_num = 3
-            tier_label = "⏱️ Tier 3: Consolidating Squeeze"
+            tier_num = 2
+            tier_label = "⚡ Tier 2: Flat 200 Magnet Squeeze"
 
-        squeeze_score = round((6.0 * closing_ma_gap) + (4.0 * sma200_slope) + (3.0 * price_to_200_gap) + closing_body_box, 4)
+        squeeze_score = round((5.0 * sma200_slope) + (4.0 * closing_ma_gap) + (3.0 * price_to_200_gap), 4)
 
         return {
             "Ticker": ticker,
             "Price": round(latest_price, 2),
+            "Daily_ATR": round(daily_atr, 2),
             "Avg_Volume": int(avg_daily_volume),
-            "Dollar_Volume_M": round(avg_dollar_volume / 1_000_000, 1),
             "SMA200_Slope_%": round(sma200_slope, 4),
             "MA_Gap_%": round(closing_ma_gap, 3),
             "Price_200_Gap_%": round(price_to_200_gap, 3),
@@ -186,7 +194,7 @@ def scan_ticker(ticker):
 
 def main():
     tickers = get_tickers()
-    send_to_discord(f"🔍 **Scanning {len(tickers)} stocks for High-Turnover Oliver Velez Candidates ($500M+ Dollar Vol)...**")
+    send_to_discord(f"🔍 **Scanning {len(tickers)} stocks ($50-$400, Vol > 2M, Daily ATR > $1.50)...**")
 
     results = []
     with ThreadPoolExecutor(max_workers=5) as executor:
@@ -198,11 +206,11 @@ def main():
         sorted_results = sorted(results, key=lambda x: (x["Tier_Num"], x["Score"]))
         top_candidates = sorted_results[:TOP_COUNT]
 
-        send_to_discord(f"🎯 **Found {len(top_candidates)} Active Market Leader Candidates:**")
+        send_to_discord(f"🎯 **Found {len(top_candidates)} Oliver Velez Narrow State Candidates:**")
 
         for item in top_candidates:
             chart_file = generate_chart(item['Ticker'], item['df'], item['Tier_Label'])
-            caption = f"📊 **{item['Ticker']}** | {item['Tier_Label']} | Price: ${item['Price']} | MA Gap: {item['MA_Gap_%']}% | Turnover: ${item['Dollar_Volume_M']}M"
+            caption = f"📊 **{item['Ticker']}** | {item['Tier_Label']} | Price: ${item['Price']} | Daily ATR: ${item['Daily_ATR']} | MA Gap: {item['MA_Gap_%']}% | Vol: {item['Avg_Volume']:,}"
             send_to_discord(caption, chart_file)
             if chart_file and os.path.exists(chart_file):
                 try:
@@ -210,7 +218,7 @@ def main():
                 except Exception:
                     pass
     else:
-        send_to_discord("ℹ️ No eligible stocks met the criteria today.")
+        send_to_discord("ℹ️ No stocks met the criteria today.")
 
 if __name__ == "__main__":
     main()
