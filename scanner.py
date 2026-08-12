@@ -19,8 +19,14 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 # --- Scan Settings ---
 MIN_PRICE = 50.0
 MAX_PRICE = 200.0
-MIN_DAILY_VOLUME = 1_000_000  # Min 1,000,000 shares average daily volume
+MIN_DAILY_VOLUME = 2_000_000  # Minimum 2 Million shares average daily volume
 TOP_COUNT = 10                # Max candidates to deliver
+
+# --- Strict Overlap & Flatness Constraints ---
+MAX_MA_DIST_PCT = 0.15        # MAs must stay glued together (max 0.15% gap in last 20 bars)
+MAX_SMA20_RANGE_PCT = 0.10    # 20 SMA must be horizontal (max 0.10% move over last 30 bars)
+MAX_SMA200_RANGE_PCT = 0.05   # 200 SMA must be horizontal (max 0.05% move over last 30 bars)
+MAX_PRICE_BOX_PCT = 0.30      # All price bars must overlap in a tight 0.30% channel
 
 def send_to_discord(caption, photo_path=None):
     if not DISCORD_WEBHOOK_URL:
@@ -109,13 +115,13 @@ def scan_ticker(ticker):
         close = df['Close']
         high = df['High']
         low = df['Low']
-        open_p = df['Open']
         volume = df['Volume']
 
         latest_price = float(close.iloc[-1])
         if not (MIN_PRICE <= latest_price <= MAX_PRICE):
             return None
 
+        # Filter by minimum 2M average daily volume
         avg_daily_volume = float(volume.resample('1D').sum().mean())
         if avg_daily_volume < MIN_DAILY_VOLUME:
             return None
@@ -125,50 +131,44 @@ def scan_ticker(ticker):
 
         ma_dist_pct = (abs(sma20 - sma200) / close) * 100.0
 
-        # Slope measurements over the last 15 bars (30 minutes)
-        sma20_slope = float(abs(sma20.iloc[-1] - sma20.iloc[-15]) / close.iloc[-1] * 100)
-        sma200_slope = float(abs(sma200.iloc[-1] - sma200.iloc[-15]) / close.iloc[-1] * 100)
-
-        # Body height relative to price over last 15-20 bars (measuring tight overlapping bars)
-        body_height_pct = (abs(close - open_p) / close) * 100
-        avg_body_15 = float(body_height_pct.iloc[-15:].mean())
-        ma_dist_15 = float(ma_dist_pct.iloc[-15:].mean())
-
-        # Oliver Velez Setup Conditions
-        is_flat_20 = sma20_slope <= 0.08
-        is_flat_200 = sma200_slope <= 0.08
-        is_close_ma = ma_dist_15 <= 0.60
-        is_tight_bars = avg_body_15 <= 0.20
-
-        # Tier 1 (Best): Close & flat 20 and 200 with tight overlapping bars
-        is_tier_1 = is_close_ma and is_flat_20 and is_flat_200 and is_tight_bars
-
-        # Tier 2 (OK): Flat 200 with a close but slightly trending 20
-        is_tier_2 = is_close_ma and is_flat_200 and (not is_flat_20)
-
-        # Tier 3 (OK): Flat 20 with a sloping 200, if last 15-20 bars are tight & overlapping
-        is_tier_3 = is_flat_20 and (not is_flat_200) and is_tight_bars
-
-        if not (is_tier_1 or is_tier_2 or is_tier_3):
+        # 1. Check Maximum MA distance in last 20 bars
+        max_ma_dist = float(ma_dist_pct.iloc[-20:].max())
+        if max_ma_dist > MAX_MA_DIST_PCT:
             return None
 
-        if is_tier_1:
-            tier_num = 1
-            tier_label = "🔥 Tier 1: Flat 20/200 & Tight Bars (Best)"
-        elif is_tier_2:
-            tier_num = 2
-            tier_label = "⚡ Tier 2: Flat 200 & Trending 20 (OK)"
-        else:
-            tier_num = 3
-            tier_label = "⏱️ Tier 3: Flat 20, Sloping 200 & Tight Bars (OK)"
+        # 2. Check 20 SMA & 200 SMA flatness over last 30 bars
+        sma20_range = float((sma20.iloc[-30:].max() - sma20.iloc[-30:].min()) / latest_price * 100)
+        sma200_range = float((sma200.iloc[-30:].max() - sma200.iloc[-30:].min()) / latest_price * 100)
 
-        score = round(ma_dist_15 + avg_body_15, 4)
+        # 3. Check Price Overlap Channel
+        price_box_pct = float((high.iloc[-20:].max() - low.iloc[-20:].min()) / latest_price * 100)
+        if price_box_pct > MAX_PRICE_BOX_PCT:
+            return None
+
+        # Categorize setup quality
+        is_flat_20 = sma20_range <= MAX_SMA20_RANGE_PCT
+        is_flat_200 = sma200_range <= MAX_SMA200_RANGE_PCT
+
+        if is_flat_20 and is_flat_200:
+            tier_num = 1
+            tier_label = "🔥 Tier 1: Perfect Flat 20/200 Squeeze"
+        elif is_flat_200:
+            tier_num = 2
+            tier_label = "⚡ Tier 2: Flat 200 & Trending 20"
+        elif is_flat_20:
+            tier_num = 3
+            tier_label = "⏱️ Tier 3: Flat 20 & Sloping 200"
+        else:
+            return None
+
+        score = round(max_ma_dist + price_box_pct, 4)
 
         return {
             "Ticker": ticker,
             "Price": round(latest_price, 2),
             "Avg_Volume": int(avg_daily_volume),
-            "MA_Dist_%": round(ma_dist_15, 3),
+            "Max_MA_Dist_%": round(max_ma_dist, 3),
+            "Price_Box_%": round(price_box_pct, 3),
             "Tier_Num": tier_num,
             "Tier_Label": tier_label,
             "Score": score,
@@ -179,7 +179,7 @@ def scan_ticker(ticker):
 
 def main():
     tickers = get_tickers()
-    send_to_discord(f"🔍 **Scanning {len(tickers)} stocks for Oliver Velez Narrow State Setup Tiers ($50-$200)...**")
+    send_to_discord(f"🔍 **Scanning {len(tickers)} stocks for Strict Overlapping Squeezes ($50-$200, Vol > 2M)...**")
 
     results = []
     with ThreadPoolExecutor(max_workers=5) as executor:
@@ -188,15 +188,14 @@ def main():
                 results.append(res)
 
     if results:
-        # Sort by Tier Number (Tier 1 Best first), then by tightest Squeeze Score
         sorted_results = sorted(results, key=lambda x: (x["Tier_Num"], x["Score"]))
         top_candidates = sorted_results[:TOP_COUNT]
 
-        send_to_discord(f"🎯 **Top {len(top_candidates)} Oliver Velez Refined Narrow State Candidates:**")
+        send_to_discord(f"🎯 **Top {len(top_candidates)} Refined Narrow State Candidates (Vol > 2M):**")
 
         for item in top_candidates:
             chart_file = generate_chart(item['Ticker'], item['df'], item['Tier_Label'])
-            caption = f"📊 **{item['Ticker']}** | {item['Tier_Label']} | Price: ${item['Price']} | SMA Dist: {item['MA_Dist_%']}% | Vol: {item['Avg_Volume']:,}"
+            caption = f"📊 **{item['Ticker']}** | {item['Tier_Label']} | Price: ${item['Price']} | MA Gap: {item['Max_MA_Dist_%']}% | Box: {item['Price_Box_%']}% | Vol: {item['Avg_Volume']:,}"
             send_to_discord(caption, chart_file)
             if chart_file and os.path.exists(chart_file):
                 try:
@@ -204,7 +203,7 @@ def main():
                 except Exception:
                     pass
     else:
-        send_to_discord("⚠️ No eligible stocks met the setup criteria today.")
+        send_to_discord("⚠️ No stocks met the strict overlapping squeeze criteria (Min Vol > 2M) today.")
 
 if __name__ == "__main__":
     main()
