@@ -54,13 +54,15 @@ def send_to_discord(caption, photo_path=None):
 
 def generate_chart(ticker, df):
     try:
-        # Calculate SMAs on full dataset FIRST so 200 SMA is valid
         df_calc = df.copy()
         df_calc['SMA20'] = df_calc['Close'].rolling(20).mean()
         df_calc['SMA200'] = df_calc['Close'].rolling(200).mean()
 
-        # Slice last 120 candles AFTER SMAs are calculated
-        chart_data = df_calc.tail(120)
+        chart_data = df_calc.tail(120).copy()
+
+        # Clean timezone from index for smooth plotting
+        if hasattr(chart_data.index, 'tz_localize') and chart_data.index.tz is not None:
+            chart_data.index = chart_data.index.tz_localize(None)
 
         add_plots = [
             mpf.make_addplot(chart_data['SMA20'], color='blue', width=1.5),
@@ -73,7 +75,7 @@ def generate_chart(ticker, df):
             style='yahoo',
             title=f"\n{ticker} - 2M Chart (20 SMA Blue / 200 SMA Green)",
             addplot=add_plots,
-            savefig=filename
+            savefig=dict(fname=filename, dpi=100)
         )
         plt.close('all')
         return filename
@@ -130,7 +132,7 @@ def scan_ticker(ticker):
 
 def main():
     tickers = get_tickers()
-    send_to_discord(f"🔍 **Scanning S&P 500 for Top 5 Narrowest 20/200 SMA Squeezes ($50-$200)...**")
+    send_to_discord(f"🔍 **[v2.0 Chart Engine] Scanning S&P 500 for Top 5 Narrowest 20/200 SMA Squeezes ($50-$200)...**")
 
     results = []
     with ThreadPoolExecutor(max_workers=5) as executor:
@@ -144,7 +146,6 @@ def main():
 
         send_to_discord(f"🎯 **Top {len(top_candidates)} Narrow State Candidates Today:**")
 
-        # Sends EACH stock as an individual message with its chart image file attached
         for item in top_candidates:
             chart_file = generate_chart(item['Ticker'], item['df'])
             caption = f"📊 **{item['Ticker']}** | Price: ${item['Price']} | 20/200 SMA Dist: {item['MA_Dist_%']}% | ATR: {item['ATR_%']}%"
