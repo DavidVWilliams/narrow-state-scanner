@@ -20,12 +20,7 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 MIN_PRICE = 50.0
 MAX_PRICE = 200.0
 MIN_DAILY_VOLUME = 2_000_000  # Minimum 2 Million shares average daily volume
-TOP_COUNT = 10                # Max candidates to deliver
-
-# --- Strict Pinning & Volatility Constraints ---
-MAX_CLOSING_MA_GAP = 0.12     # 20 SMA & 200 SMA must be within 0.12% at close
-MAX_PRICE_TO_200_GAP = 0.15   # Price must be within 0.15% of 200 SMA at close
-MAX_CLOSING_BOX_PCT = 0.20    # Final 15-min price box must be <= 0.20% (no late dumps/spikes)
+TOP_COUNT = 10                # Always delivers Top 10 candidates
 
 def send_to_discord(caption, photo_path=None):
     if not DISCORD_WEBHOOK_URL:
@@ -142,24 +137,28 @@ def scan_ticker(ticker):
         sma200_slope = float(abs(sma200.iloc[-1] - sma200.iloc[-30]) / latest_price * 100)
         sma20_slope = float(abs(sma20.iloc[-1] - sma20.iloc[-15]) / latest_price * 100)
 
-        # Strict Filter Checks
-        if closing_ma_gap > MAX_CLOSING_MA_GAP or price_to_200_gap > MAX_PRICE_TO_200_GAP or closing_box_pct > MAX_CLOSING_BOX_PCT:
-            return None
-
+        # Categorize Tiers
         is_flat_200 = sma200_slope <= 0.05
         is_flat_20 = sma20_slope <= 0.10
+        is_pinned = closing_ma_gap <= 0.15 and price_to_200_gap <= 0.20
 
-        if is_flat_200 and is_flat_20:
+        if is_flat_200 and is_flat_20 and is_pinned:
             tier_num = 1
             tier_label = "🔥 Tier 1: Perfect Flat 200 & 20 Pin"
-        elif is_flat_200:
+        elif is_flat_200 and is_pinned:
             tier_num = 2
-            tier_label = "⚡ Tier 2: Flat 200 Magnet Squeeze"
+            tier_label = "⚡ Tier 2: Flat 200 Magnet Pin"
         else:
             tier_num = 3
-            tier_label = "⏱️ Tier 3: Consolidating Pin"
+            tier_label = "⏱️ Tier 3: Narrow State Squeeze"
 
-        squeeze_score = round((4.0 * sma200_slope) + (3.0 * closing_ma_gap) + (2.0 * price_to_200_gap) + closing_box_pct, 4)
+        # Weighted Squeeze Penalty Score (Lower is better)
+        squeeze_score = round(
+            (5.0 * sma200_slope) + 
+            (4.0 * closing_ma_gap) + 
+            (3.0 * price_to_200_gap) + 
+            (2.0 * closing_box_pct), 4
+        )
 
         return {
             "Ticker": ticker,
@@ -179,7 +178,7 @@ def scan_ticker(ticker):
 
 def main():
     tickers = get_tickers()
-    send_to_discord(f"🔍 **Scanning {len(tickers)} stocks for Quiet Pinned Squeezes ($50-$200)...**")
+    send_to_discord(f"🔍 **Scanning {len(tickers)} stocks for Pinned 20/200 SMA Squeezes ($50-$200, Vol > 2M)...**")
 
     results = []
     with ThreadPoolExecutor(max_workers=5) as executor:
@@ -188,10 +187,11 @@ def main():
                 results.append(res)
 
     if results:
+        # Rank by Tier Number (Tier 1 first) then by best Squeeze Score
         sorted_results = sorted(results, key=lambda x: (x["Tier_Num"], x["Score"]))
         top_candidates = sorted_results[:TOP_COUNT]
 
-        send_to_discord(f"🎯 **Top {len(top_candidates)} Quiet Pinned Narrow State Candidates:**")
+        send_to_discord(f"🎯 **Top {len(top_candidates)} Oliver Velez Pinned Squeeze Candidates:**")
 
         for item in top_candidates:
             chart_file = generate_chart(item['Ticker'], item['df'], item['Tier_Label'])
@@ -203,7 +203,7 @@ def main():
                 except Exception:
                     pass
     else:
-        send_to_discord("⚠️ No eligible stocks met the quiet pinned squeeze criteria today.")
+        send_to_discord("⚠️ No eligible stocks met the price criteria today.")
 
 if __name__ == "__main__":
     main()
