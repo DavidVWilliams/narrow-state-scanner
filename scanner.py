@@ -16,11 +16,11 @@ from concurrent.futures import ThreadPoolExecutor
 
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
-# --- Customizable Settings ---
+# --- Scan Settings ---
 MIN_PRICE = 50.0
 MAX_PRICE = 200.0
-MIN_DAILY_VOLUME = 1_000_000  # Minimum 1 Million shares average daily volume
-TOP_COUNT = 10                # Number of top candidates to deliver (Top 10)
+MIN_DAILY_VOLUME = 1_000_000  # Min 1,000,000 shares average daily volume
+TOP_COUNT = 10                # Top 10 Narrow State candidates
 
 def send_to_discord(caption, photo_path=None):
     if not DISCORD_WEBHOOK_URL:
@@ -68,14 +68,14 @@ def generate_chart(ticker, df):
 
         add_plots = [
             mpf.make_addplot(chart_data['SMA20'], color='blue', width=1.5),
-            mpf.make_addplot(chart_data['SMA200'], color='green', width=2.0)
+            mpf.make_addplot(chart_data['SMA200'], color='red', width=2.0)
         ]
         filename = f"{ticker}_2m.png"
         mpf.plot(
             chart_data,
             type='candle',
             style='yahoo',
-            title=f"\n{ticker} - 2M Chart (20 SMA Blue / 200 SMA Green)",
+            title=f"\n{ticker} - 2M Chart (20 SMA Blue / 200 SMA Red)",
             addplot=add_plots,
             savefig=dict(fname=filename, dpi=100)
         )
@@ -87,19 +87,17 @@ def generate_chart(ticker, df):
 
 def get_tickers():
     try:
-        # S&P 500 dataset
         url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
         df_sp = pd.read_csv(url)
         sp_tickers = df_sp['Symbol'].tolist()
         
-        # Additional liquid market tickers
-        extra_tickers = ["QQQ", "SPY", "IWM", "TSLA", "NVDA", "AMD", "AMZN", "META", "GOOGL", "AAPL", "MSFT", "PLTR", "SOFI", "HOOD", "UBER", "ABNB", "COIN", "MARA", "RIOT", "DKNG", "SNAP", "SQ", "SHOP", "RBLX", "PALO"]
+        extra_tickers = ["DIS", "QQQ", "SPY", "IWM", "TSLA", "NVDA", "AMD", "AMZN", "META", "GOOGL", "AAPL", "MSFT", "PLTR", "SOFI", "HOOD", "UBER", "ABNB", "COIN", "MARA", "RIOT", "DKNG", "SNAP", "SQ", "SHOP", "RBLX", "PALO"]
         
         all_tickers = list(set(sp_tickers + extra_tickers))
         return [t.replace('.', '-') for t in all_tickers]
     except Exception as e:
         print(f"Error fetching tickers: {e}")
-        return ["AMD", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "INTC", "PYPL", "QCOM", "TXN"]
+        return ["DIS", "AMD", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "INTC", "PYPL", "QCOM"]
 
 def scan_ticker(ticker):
     try:
@@ -117,7 +115,6 @@ def scan_ticker(ticker):
         if not (MIN_PRICE <= latest_price <= MAX_PRICE):
             return None
 
-        # Filter by minimum average daily volume
         avg_daily_volume = float(volume.resample('1D').sum().mean())
         if avg_daily_volume < MIN_DAILY_VOLUME:
             return None
@@ -131,14 +128,15 @@ def scan_ticker(ticker):
         ma_dist_pct = (abs(sma20 - sma200) / close) * 100.0
         atr_pct = (atr14 / close) * 100.0
 
-        latest_ma_dist = float(ma_dist_pct.dropna().iloc[-1])
+        # Find the MINIMUM 20/200 SMA squeeze across the last 60 two-minute bars (2 hours)
+        min_ma_dist = float(ma_dist_pct.iloc[-60:].min())
         latest_atr_pct = float(atr_pct.dropna().iloc[-1])
 
         return {
             "Ticker": ticker,
             "Price": round(latest_price, 2),
             "Avg_Volume": int(avg_daily_volume),
-            "MA_Dist_%": round(latest_ma_dist, 3),
+            "MA_Dist_%": round(min_ma_dist, 3),
             "ATR_%": round(latest_atr_pct, 3),
             "df": df
         }
@@ -147,7 +145,7 @@ def scan_ticker(ticker):
 
 def main():
     tickers = get_tickers()
-    send_to_discord(f"🔍 **Scanning {len(tickers)} stocks for Top {TOP_COUNT} Narrowest 20/200 SMA Squeezes ($50-$200, Min Vol: {MIN_DAILY_VOLUME:,})...**")
+    send_to_discord(f"🔍 **Scanning {len(tickers)} stocks for Top {TOP_COUNT} Afternoon Narrow State Squeezes ($50-$200)...**")
 
     results = []
     with ThreadPoolExecutor(max_workers=5) as executor:
@@ -163,7 +161,7 @@ def main():
 
         for item in top_candidates:
             chart_file = generate_chart(item['Ticker'], item['df'])
-            caption = f"📊 **{item['Ticker']}** | Price: ${item['Price']} | 20/200 SMA Dist: {item['MA_Dist_%']}% | Avg Vol: {item['Avg_Volume']:,}"
+            caption = f"📊 **{item['Ticker']}** | Price: ${item['Price']} | 20/200 SMA Squeeze Dist: {item['MA_Dist_%']}% | Avg Vol: {item['Avg_Volume']:,}"
             send_to_discord(caption, chart_file)
             if chart_file and os.path.exists(chart_file):
                 try:
