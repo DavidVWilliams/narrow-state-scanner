@@ -20,7 +20,7 @@ MAX_PRICE = 200.0
 
 def send_to_discord(caption, photo_path=None):
     if not DISCORD_WEBHOOK_URL:
-        print(f"NO WEBHOOK URL: {caption}")
+        print("NO WEBHOOK URL set.")
         return
     
     try:
@@ -28,7 +28,8 @@ def send_to_discord(caption, photo_path=None):
             with open(photo_path, "rb") as photo:
                 files = {"file": (os.path.basename(photo_path), photo, "image/png")}
                 payload = {"content": caption}
-                requests.post(DISCORD_WEBHOOK_URL, data=payload, files=files)
+                res = requests.post(DISCORD_WEBHOOK_URL, data=payload, files=files)
+                print(f"Discord Upload Response: {res.status_code}")
         else:
             requests.post(DISCORD_WEBHOOK_URL, json={"content": caption})
     except Exception as e:
@@ -36,13 +37,17 @@ def send_to_discord(caption, photo_path=None):
 
 def generate_chart(ticker, df):
     try:
-        chart_data = df.tail(120).copy()
-        sma20 = chart_data['Close'].rolling(20).mean()
-        sma200 = chart_data['Close'].rolling(200).mean()
+        # Calculate SMAs on full dataset FIRST so 200 SMA is valid
+        df_calc = df.copy()
+        df_calc['SMA20'] = df_calc['Close'].rolling(20).mean()
+        df_calc['SMA200'] = df_calc['Close'].rolling(200).mean()
+
+        # Slice last 120 candles AFTER SMAs are calculated
+        chart_data = df_calc.tail(120)
 
         add_plots = [
-            mpf.make_addplot(sma20, color='blue', width=1.5),
-            mpf.make_addplot(sma200, color='green', width=2.0)
+            mpf.make_addplot(chart_data['SMA20'], color='blue', width=1.5),
+            mpf.make_addplot(chart_data['SMA200'], color='green', width=2.0)
         ]
         filename = f"{ticker}_2m.png"
         mpf.plot(
@@ -73,7 +78,7 @@ def scan_ticker(ticker):
     try:
         t_obj = yf.Ticker(ticker)
         df = t_obj.history(period="5d", interval="2m")
-        if df.empty or len(df) < 150:
+        if df.empty or len(df) < 200:
             return None
 
         close = df['Close']
@@ -117,7 +122,6 @@ def main():
                 results.append(res)
 
     if results:
-        # Rank stocks by smallest 20/200 SMA distance (narrowest state)
         sorted_results = sorted(results, key=lambda x: x["MA_Dist_%"])
         top_candidates = sorted_results[:5]
 
