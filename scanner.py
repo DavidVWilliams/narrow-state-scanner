@@ -22,12 +22,7 @@ MAX_PRICE = 400.0             # Max price $400.00
 MIN_DAILY_VOLUME = 2_000_000  # Minimum 2 Million shares average daily volume
 MIN_DOLLAR_VOLUME = 500_000_000 # Minimum $500 Million daily turnover
 MIN_DAILY_ATR = 1.50          # Minimum Daily ATR of $1.50
-TOP_COUNT = 10                # Deliver Top 10 candidates
-
-# --- Calibrated Oliver Velez Thresholds ---
-MAX_200_SLOPE_PCT = 0.15      # Max 0.15% 200 SMA slope (Passes PLTR [0.11%], DIS [0.02%], Rejects CRM [0.22%], O [0.37%])
-MAX_CLOSING_MA_GAP = 0.15     # Max 0.15% MA gap at close
-MAX_PRICE_200_GAP = 0.20      # Max 0.20% price distance to 200 SMA at close
+TOP_COUNT = 15                # Delivered candidate limit increased to 15
 
 def send_to_discord(caption, photo_path=None):
     if not DISCORD_WEBHOOK_URL:
@@ -110,9 +105,10 @@ def scan_ticker(ticker):
     try:
         t_obj = yf.Ticker(ticker)
         
-        # 1. Check Daily ATR (Must be >= $1.50)
+        # 1. Daily ATR check
         df_daily = t_obj.history(period="1mo", interval="1d")
         if df_daily.empty or len(df_daily) < 14:
+            if ticker == "PLTR": send_to_discord("⚠️ PLTR Debug: Daily data empty")
             return None
             
         d_tr = np.maximum(
@@ -121,11 +117,13 @@ def scan_ticker(ticker):
         )
         daily_atr = float(d_tr.rolling(14).mean().iloc[-1])
         if daily_atr < MIN_DAILY_ATR:
+            if ticker == "PLTR": send_to_discord(f"⚠️ PLTR Debug: Daily ATR ${daily_atr:.2f} < ${MIN_DAILY_ATR}")
             return None
 
-        # 2. Download 2-minute intraday data (Regular Trading Hours only)
+        # 2. Intraday 2m data
         df = t_obj.history(period="7d", interval="2m", prepost=False)
-        if df.empty or len(df) < 200:
+        if df.empty or len(df) < 50:
+            if ticker == "PLTR": send_to_discord("⚠️ PLTR Debug: Intraday 2m data empty")
             return None
 
         close = df['Close']
@@ -133,14 +131,17 @@ def scan_ticker(ticker):
 
         latest_price = float(close.iloc[-1])
         if not (MIN_PRICE <= latest_price <= MAX_PRICE):
+            if ticker == "PLTR": send_to_discord(f"⚠️ PLTR Debug: Price ${latest_price} out of range")
             return None
 
         avg_daily_volume = float(volume.resample('1D').sum().mean())
         if avg_daily_volume < MIN_DAILY_VOLUME:
+            if ticker == "PLTR": send_to_discord("⚠️ PLTR Debug: Volume too low")
             return None
 
         avg_dollar_volume = latest_price * avg_daily_volume
         if avg_dollar_volume < MIN_DOLLAR_VOLUME:
+            if ticker == "PLTR": send_to_discord("⚠️ PLTR Debug: Dollar volume too low")
             return None
 
         sma20 = close.rolling(20).mean()
@@ -148,19 +149,16 @@ def scan_ticker(ticker):
 
         ma_dist_pct = (abs(sma20 - sma200) / close) * 100.0
 
-        # 200 SMA Slope over last 30 bars (Passes PLTR [0.114%])
         sma200_slope = float(abs(sma200.iloc[-1] - sma200.iloc[-30]) / latest_price * 100)
-        if sma200_slope > MAX_200_SLOPE_PCT:
-            return None
-
-        # 20 SMA & 200 SMA Gap at close (last 5 bars / 10 mins)
         closing_ma_gap = float(ma_dist_pct.iloc[-5:].mean())
-        if closing_ma_gap > MAX_CLOSING_MA_GAP:
-            return None
-
-        # Price distance from 200 SMA at close
         price_to_200_gap = float(abs(latest_price - sma200.iloc[-1]) / latest_price * 100)
-        if price_to_200_gap > MAX_PRICE_200_GAP:
+
+        # PLTR Status Report
+        if ticker == "PLTR":
+            send_to_discord(f"📊 **PLTR Status**: Price: ${latest_price:.2f} | Daily ATR: ${daily_atr:.2f} | 200 Slope: {sma200_slope:.4f}% | MA Gap: {closing_ma_gap:.3f}% | Price/200 Gap: {price_to_200_gap:.3f}%")
+
+        if sma200_slope > 0.20 or closing_ma_gap > 0.25 or price_to_200_gap > 0.30:
+            if ticker == "PLTR": send_to_discord("⚠️ PLTR Debug: Failed slope/gap filter")
             return None
 
         sma20_slope = float(abs(sma20.iloc[-1] - sma20.iloc[-15]) / latest_price * 100)
@@ -190,6 +188,7 @@ def scan_ticker(ticker):
             "df": df
         }
     except Exception as e:
+        if ticker == "PLTR": send_to_discord(f"❌ PLTR Exception: {e}")
         return None
 
 def main():
@@ -206,7 +205,7 @@ def main():
         sorted_results = sorted(results, key=lambda x: (x["Tier_Num"], x["Score"]))
         top_candidates = sorted_results[:TOP_COUNT]
 
-        send_to_discord(f"🎯 **Found {len(top_candidates)} Oliver Velez Candidates:**")
+        send_to_discord(f"🎯 **Found {len(top_candidates)} Candidates (Top {TOP_COUNT} Delivered):**")
 
         for item in top_candidates:
             chart_file = generate_chart(item['Ticker'], item['df'], item['Tier_Label'])
