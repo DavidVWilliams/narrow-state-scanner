@@ -16,12 +16,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
-# --- Strict Scan Settings ---
+# --- Scan Settings ---
 MIN_PRICE = 50.0
 MAX_PRICE = 200.0
 MIN_DAILY_VOLUME = 1_000_000  # Min 1,000,000 shares average daily volume
-MAX_MA_DIST_PCT = 0.60        # Max avg 20/200 SMA distance over last 45m (%)
-MAX_ATR_PCT = 0.35            # Max avg 14-period ATR over last 45m (%)
 TOP_COUNT = 10                # Max candidates to deliver
 
 def send_to_discord(caption, photo_path=None):
@@ -57,7 +55,7 @@ def send_to_discord(caption, photo_path=None):
     except Exception as e:
         print(f"Error sending to Discord: {e}")
 
-def generate_chart(ticker, df):
+def generate_chart(ticker, df, tier_label):
     try:
         df_calc = df.copy()
         df_calc['SMA20'] = df_calc['Close'].rolling(20).mean()
@@ -77,7 +75,7 @@ def generate_chart(ticker, df):
             chart_data,
             type='candle',
             style='yahoo',
-            title=f"\n{ticker} - 2M Chart (20 SMA Blue / 200 SMA Red)",
+            title=f"\n{ticker} - {tier_label}",
             addplot=add_plots,
             savefig=dict(fname=filename, dpi=100)
         )
@@ -111,6 +109,7 @@ def scan_ticker(ticker):
         close = df['Close']
         high = df['High']
         low = df['Low']
+        open_p = df['Open']
         volume = df['Volume']
 
         latest_price = float(close.iloc[-1])
@@ -124,32 +123,55 @@ def scan_ticker(ticker):
         sma20 = close.rolling(20).mean()
         sma200 = close.rolling(200).mean()
 
-        tr = np.maximum(high - low, np.maximum(abs(high - close.shift(1)), abs(low - close.shift(1))))
-        atr14 = tr.rolling(14).mean()
-
         ma_dist_pct = (abs(sma20 - sma200) / close) * 100.0
-        atr_pct = (atr14 / close) * 100.0
 
-        # Evaluate averages over the LAST 45 MINUTES (23 two-minute bars: 3:15 PM - 4:00 PM ET)
-        recent_ma_dist = ma_dist_pct.iloc[-23:]
-        recent_atr = atr_pct.iloc[-23:]
+        # Slope measurements over the last 15 bars (30 minutes)
+        sma20_slope = float(abs(sma20.iloc[-1] - sma20.iloc[-15]) / close.iloc[-1] * 100)
+        sma200_slope = float(abs(sma200.iloc[-1] - sma200.iloc[-15]) / close.iloc[-1] * 100)
 
-        avg_ma_dist = float(recent_ma_dist.mean())
-        avg_atr_pct = float(recent_atr.mean())
+        # Body height relative to price over last 15-20 bars (measuring tight overlapping bars)
+        body_height_pct = (abs(close - open_p) / close) * 100
+        avg_body_15 = float(body_height_pct.iloc[-15:].mean())
+        ma_dist_15 = float(ma_dist_pct.iloc[-15:].mean())
 
-        # Strict Narrow State Filter: MUST satisfy BOTH max distance and max ATR over last 45m
-        if avg_ma_dist > MAX_MA_DIST_PCT or avg_atr_pct > MAX_ATR_PCT:
+        # Oliver Velez Setup Conditions
+        is_flat_20 = sma20_slope <= 0.08
+        is_flat_200 = sma200_slope <= 0.08
+        is_close_ma = ma_dist_15 <= 0.60
+        is_tight_bars = avg_body_15 <= 0.20
+
+        # Tier 1 (Best): Close & flat 20 and 200 with tight overlapping bars
+        is_tier_1 = is_close_ma and is_flat_20 and is_flat_200 and is_tight_bars
+
+        # Tier 2 (OK): Flat 200 with a close but slightly trending 20
+        is_tier_2 = is_close_ma and is_flat_200 and (not is_flat_20)
+
+        # Tier 3 (OK): Flat 20 with a sloping 200, if last 15-20 bars are tight & overlapping
+        is_tier_3 = is_flat_20 and (not is_flat_200) and is_tight_bars
+
+        if not (is_tier_1 or is_tier_2 or is_tier_3):
             return None
 
-        squeeze_score = round(avg_ma_dist + avg_atr_pct, 4)
+        if is_tier_1:
+            tier_num = 1
+            tier_label = "🔥 Tier 1: Flat 20/200 & Tight Bars (Best)"
+        elif is_tier_2:
+            tier_num = 2
+            tier_label = "⚡ Tier 2: Flat 200 & Trending 20 (OK)"
+        else:
+            tier_num = 3
+            tier_label = "⏱️ Tier 3: Flat 20, Sloping 200 & Tight Bars (OK)"
+
+        score = round(ma_dist_15 + avg_body_15, 4)
 
         return {
             "Ticker": ticker,
             "Price": round(latest_price, 2),
             "Avg_Volume": int(avg_daily_volume),
-            "MA_Dist_%": round(avg_ma_dist, 3),
-            "ATR_%": round(avg_atr_pct, 3),
-            "Score": squeeze_score,
+            "MA_Dist_%": round(ma_dist_15, 3),
+            "Tier_Num": tier_num,
+            "Tier_Label": tier_label,
+            "Score": score,
             "df": df
         }
     except Exception as e:
@@ -157,7 +179,7 @@ def scan_ticker(ticker):
 
 def main():
     tickers = get_tickers()
-    send_to_discord(f"🔍 **Scanning {len(tickers)} stocks for 45-Min Closing Squeezes (3:15-4:00 PM ET, $50-$200, Vol > 1M)...**")
+    send_to_discord(f"🔍 **Scanning {len(tickers)} stocks for Oliver Velez Narrow State Setup Tiers ($50-$200)...**")
 
     results = []
     with ThreadPoolExecutor(max_workers=5) as executor:
@@ -166,15 +188,15 @@ def main():
                 results.append(res)
 
     if results:
-        # Sort by tightest overall Squeeze Score (MA distance + ATR)
-        sorted_results = sorted(results, key=lambda x: x["Score"])
+        # Sort by Tier Number (Tier 1 Best first), then by tightest Squeeze Score
+        sorted_results = sorted(results, key=lambda x: (x["Tier_Num"], x["Score"]))
         top_candidates = sorted_results[:TOP_COUNT]
 
-        send_to_discord(f"🎯 **Top {len(top_candidates)} Strict Narrow State Candidates (Last 45 Mins):**")
+        send_to_discord(f"🎯 **Top {len(top_candidates)} Oliver Velez Refined Narrow State Candidates:**")
 
         for item in top_candidates:
-            chart_file = generate_chart(item['Ticker'], item['df'])
-            caption = f"📊 **{item['Ticker']}** | Price: ${item['Price']} | 45m Avg SMA Dist: {item['MA_Dist_%']}% | Avg ATR: {item['ATR_%']}% | Vol: {item['Avg_Volume']:,}"
+            chart_file = generate_chart(item['Ticker'], item['df'], item['Tier_Label'])
+            caption = f"📊 **{item['Ticker']}** | {item['Tier_Label']} | Price: ${item['Price']} | SMA Dist: {item['MA_Dist_%']}% | Vol: {item['Avg_Volume']:,}"
             send_to_discord(caption, chart_file)
             if chart_file and os.path.exists(chart_file):
                 try:
@@ -182,7 +204,7 @@ def main():
                 except Exception:
                     pass
     else:
-        send_to_discord("⚠️ No stocks met the strict 45-minute Narrow State criteria today.")
+        send_to_discord("⚠️ No eligible stocks met the setup criteria today.")
 
 if __name__ == "__main__":
     main()
