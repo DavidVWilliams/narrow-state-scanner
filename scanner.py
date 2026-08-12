@@ -28,7 +28,6 @@ def send_to_discord(caption, photo_path=None):
         if photo_path and os.path.exists(photo_path):
             filename = os.path.basename(photo_path)
             with open(photo_path, "rb") as photo:
-                # Discord API v10 requires explicit attachment mapping
                 files = {
                     "files[0]": (filename, photo, "image/png")
                 }
@@ -46,7 +45,7 @@ def send_to_discord(caption, photo_path=None):
                     data={"payload_json": json.dumps(payload)},
                     files=files
                 )
-                print(f"Discord Upload Response: {res.status_code}")
+                print(f"Discord Upload Response for {filename}: {res.status_code}")
         else:
             res = requests.post(DISCORD_WEBHOOK_URL, json={"content": caption})
             print(f"Discord Text Response: {res.status_code}")
@@ -55,7 +54,7 @@ def send_to_discord(caption, photo_path=None):
 
 def generate_chart(ticker, df):
     try:
-        # Calculate SMAs on full dataset FIRST
+        # Calculate SMAs on full dataset FIRST so 200 SMA is valid
         df_calc = df.copy()
         df_calc['SMA20'] = df_calc['Close'].rolling(20).mean()
         df_calc['SMA200'] = df_calc['Close'].rolling(200).mean()
@@ -144,6 +143,8 @@ def main():
         top_candidates = sorted_results[:5]
 
         send_to_discord(f"🎯 **Top {len(top_candidates)} Narrow State Candidates Today:**")
+
+        # Sends EACH stock as an individual message with its chart image file attached
         for item in top_candidates:
             chart_file = generate_chart(item['Ticker'], item['df'])
             caption = f"📊 **{item['Ticker']}** | Price: ${item['Price']} | 20/200 SMA Dist: {item['MA_Dist_%']}% | ATR: {item['ATR_%']}%"
