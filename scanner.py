@@ -16,8 +16,11 @@ from concurrent.futures import ThreadPoolExecutor
 
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
+# --- Customizable Settings ---
 MIN_PRICE = 50.0
 MAX_PRICE = 200.0
+MIN_DAILY_VOLUME = 1_000_000  # Minimum 1 Million shares average daily volume
+TOP_COUNT = 10                # Number of top candidates to deliver (Top 10)
 
 def send_to_discord(caption, photo_path=None):
     if not DISCORD_WEBHOOK_URL:
@@ -60,7 +63,6 @@ def generate_chart(ticker, df):
 
         chart_data = df_calc.tail(120).copy()
 
-        # Clean timezone from index for smooth plotting
         if hasattr(chart_data.index, 'tz_localize') and chart_data.index.tz is not None:
             chart_data.index = chart_data.index.tz_localize(None)
 
@@ -85,10 +87,16 @@ def generate_chart(ticker, df):
 
 def get_tickers():
     try:
+        # S&P 500 dataset
         url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
-        df = pd.read_csv(url)
-        tickers = df['Symbol'].tolist()
-        return [t.replace('.', '-') for t in tickers]
+        df_sp = pd.read_csv(url)
+        sp_tickers = df_sp['Symbol'].tolist()
+        
+        # Additional liquid market tickers
+        extra_tickers = ["QQQ", "SPY", "IWM", "TSLA", "NVDA", "AMD", "AMZN", "META", "GOOGL", "AAPL", "MSFT", "PLTR", "SOFI", "HOOD", "UBER", "ABNB", "COIN", "MARA", "RIOT", "DKNG", "SNAP", "SQ", "SHOP", "RBLX", "PALO"]
+        
+        all_tickers = list(set(sp_tickers + extra_tickers))
+        return [t.replace('.', '-') for t in all_tickers]
     except Exception as e:
         print(f"Error fetching tickers: {e}")
         return ["AMD", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "INTC", "PYPL", "QCOM", "TXN"]
@@ -103,9 +111,15 @@ def scan_ticker(ticker):
         close = df['Close']
         high = df['High']
         low = df['Low']
+        volume = df['Volume']
 
         latest_price = float(close.iloc[-1])
         if not (MIN_PRICE <= latest_price <= MAX_PRICE):
+            return None
+
+        # Filter by minimum average daily volume
+        avg_daily_volume = float(volume.resample('1D').sum().mean())
+        if avg_daily_volume < MIN_DAILY_VOLUME:
             return None
 
         sma20 = close.rolling(20).mean()
@@ -123,6 +137,7 @@ def scan_ticker(ticker):
         return {
             "Ticker": ticker,
             "Price": round(latest_price, 2),
+            "Avg_Volume": int(avg_daily_volume),
             "MA_Dist_%": round(latest_ma_dist, 3),
             "ATR_%": round(latest_atr_pct, 3),
             "df": df
@@ -132,7 +147,7 @@ def scan_ticker(ticker):
 
 def main():
     tickers = get_tickers()
-    send_to_discord(f"🔍 **[v2.0 Chart Engine] Scanning S&P 500 for Top 5 Narrowest 20/200 SMA Squeezes ($50-$200)...**")
+    send_to_discord(f"🔍 **Scanning {len(tickers)} stocks for Top {TOP_COUNT} Narrowest 20/200 SMA Squeezes ($50-$200, Min Vol: {MIN_DAILY_VOLUME:,})...**")
 
     results = []
     with ThreadPoolExecutor(max_workers=5) as executor:
@@ -142,13 +157,13 @@ def main():
 
     if results:
         sorted_results = sorted(results, key=lambda x: x["MA_Dist_%"])
-        top_candidates = sorted_results[:5]
+        top_candidates = sorted_results[:TOP_COUNT]
 
         send_to_discord(f"🎯 **Top {len(top_candidates)} Narrow State Candidates Today:**")
 
         for item in top_candidates:
             chart_file = generate_chart(item['Ticker'], item['df'])
-            caption = f"📊 **{item['Ticker']}** | Price: ${item['Price']} | 20/200 SMA Dist: {item['MA_Dist_%']}% | ATR: {item['ATR_%']}%"
+            caption = f"📊 **{item['Ticker']}** | Price: ${item['Price']} | 20/200 SMA Dist: {item['MA_Dist_%']}% | Avg Vol: {item['Avg_Volume']:,}"
             send_to_discord(caption, chart_file)
             if chart_file and os.path.exists(chart_file):
                 try:
@@ -156,7 +171,7 @@ def main():
                 except Exception:
                     pass
     else:
-        send_to_discord("⚠️ No eligible stocks met the price criteria today.")
+        send_to_discord("⚠️ No eligible stocks met the criteria today.")
 
 if __name__ == "__main__":
     main()
