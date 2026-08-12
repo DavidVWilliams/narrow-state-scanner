@@ -20,13 +20,7 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 MIN_PRICE = 50.0
 MAX_PRICE = 200.0
 MIN_DAILY_VOLUME = 2_000_000  # Minimum 2 Million shares average daily volume
-TOP_COUNT = 10                # Max candidates to deliver
-
-# --- Strict Overlap & Flatness Constraints ---
-MAX_MA_DIST_PCT = 0.15        # MAs must stay glued together (max 0.15% gap in last 20 bars)
-MAX_SMA20_RANGE_PCT = 0.10    # 20 SMA must be horizontal (max 0.10% move over last 30 bars)
-MAX_SMA200_RANGE_PCT = 0.05   # 200 SMA must be horizontal (max 0.05% move over last 30 bars)
-MAX_PRICE_BOX_PCT = 0.30      # All price bars must overlap in a tight 0.30% channel
+TOP_COUNT = 10                # Deliver Top 10 candidates
 
 def send_to_discord(caption, photo_path=None):
     if not DISCORD_WEBHOOK_URL:
@@ -121,7 +115,6 @@ def scan_ticker(ticker):
         if not (MIN_PRICE <= latest_price <= MAX_PRICE):
             return None
 
-        # Filter by minimum 2M average daily volume
         avg_daily_volume = float(volume.resample('1D').sum().mean())
         if avg_daily_volume < MIN_DAILY_VOLUME:
             return None
@@ -131,47 +124,45 @@ def scan_ticker(ticker):
 
         ma_dist_pct = (abs(sma20 - sma200) / close) * 100.0
 
-        # 1. Check Maximum MA distance in last 20 bars
-        max_ma_dist = float(ma_dist_pct.iloc[-20:].max())
-        if max_ma_dist > MAX_MA_DIST_PCT:
-            return None
+        # Measure 200 SMA slope over last 30 bars (key Oliver Velez baseline factor)
+        sma200_slope = float(abs(sma200.iloc[-1] - sma200.iloc[-30]) / latest_price * 100)
+        
+        # Measure 20 SMA slope over last 15 bars
+        sma20_slope = float(abs(sma20.iloc[-1] - sma20.iloc[-15]) / latest_price * 100)
 
-        # 2. Check 20 SMA & 200 SMA flatness over last 30 bars
-        sma20_range = float((sma20.iloc[-30:].max() - sma20.iloc[-30:].min()) / latest_price * 100)
-        sma200_range = float((sma200.iloc[-30:].max() - sma200.iloc[-30:].min()) / latest_price * 100)
+        # Closing 30-minute 20/200 SMA Gap
+        closing_ma_gap = float(ma_dist_pct.iloc[-15:].mean())
 
-        # 3. Check Price Overlap Channel
+        # Price overlap channel over last 20 bars
         price_box_pct = float((high.iloc[-20:].max() - low.iloc[-20:].min()) / latest_price * 100)
-        if price_box_pct > MAX_PRICE_BOX_PCT:
-            return None
 
-        # Categorize setup quality
-        is_flat_20 = sma20_range <= MAX_SMA20_RANGE_PCT
-        is_flat_200 = sma200_range <= MAX_SMA200_RANGE_PCT
+        # Categorize setup tier
+        is_flat_200 = sma200_slope <= 0.05
+        is_flat_20 = sma20_slope <= 0.10
+        is_close_ma = closing_ma_gap <= 0.30
 
-        if is_flat_20 and is_flat_200:
+        if is_flat_200 and is_flat_20 and is_close_ma:
             tier_num = 1
-            tier_label = "🔥 Tier 1: Perfect Flat 20/200 Squeeze"
-        elif is_flat_200:
+            tier_label = "🔥 Tier 1: Perfect Flat 200 & 20 Squeeze"
+        elif is_flat_200 and is_close_ma:
             tier_num = 2
-            tier_label = "⚡ Tier 2: Flat 200 & Trending 20"
-        elif is_flat_20:
-            tier_num = 3
-            tier_label = "⏱️ Tier 3: Flat 20 & Sloping 200"
+            tier_label = "⚡ Tier 2: Flat 200 Magnet Squeeze"
         else:
-            return None
+            tier_num = 3
+            tier_label = "⏱️ Tier 3: Consolidating Squeeze"
 
-        score = round(max_ma_dist + price_box_pct, 4)
+        # Score heavily weights 200 SMA flatness (4x weight)
+        squeeze_score = round((4.0 * sma200_slope) + (2.0 * closing_ma_gap) + (1.0 * price_box_pct), 4)
 
         return {
             "Ticker": ticker,
             "Price": round(latest_price, 2),
             "Avg_Volume": int(avg_daily_volume),
-            "Max_MA_Dist_%": round(max_ma_dist, 3),
-            "Price_Box_%": round(price_box_pct, 3),
+            "SMA200_Slope_%": round(sma200_slope, 4),
+            "MA_Gap_%": round(closing_ma_gap, 3),
             "Tier_Num": tier_num,
             "Tier_Label": tier_label,
-            "Score": score,
+            "Score": squeeze_score,
             "df": df
         }
     except Exception as e:
@@ -179,7 +170,7 @@ def scan_ticker(ticker):
 
 def main():
     tickers = get_tickers()
-    send_to_discord(f"🔍 **Scanning {len(tickers)} stocks for Strict Overlapping Squeezes ($50-$200, Vol > 2M)...**")
+    send_to_discord(f"🔍 **Scanning {len(tickers)} stocks (Flat 200 SMA Prioritized, $50-$200)...**")
 
     results = []
     with ThreadPoolExecutor(max_workers=5) as executor:
@@ -188,14 +179,15 @@ def main():
                 results.append(res)
 
     if results:
+        # Rank by Tier Number (Tier 1 first) then by best 200 SMA Flatness Score
         sorted_results = sorted(results, key=lambda x: (x["Tier_Num"], x["Score"]))
         top_candidates = sorted_results[:TOP_COUNT]
 
-        send_to_discord(f"🎯 **Top {len(top_candidates)} Refined Narrow State Candidates (Vol > 2M):**")
+        send_to_discord(f"🎯 **Top {len(top_candidates)} Oliver Velez Flat-200 Squeeze Candidates:**")
 
         for item in top_candidates:
             chart_file = generate_chart(item['Ticker'], item['df'], item['Tier_Label'])
-            caption = f"📊 **{item['Ticker']}** | {item['Tier_Label']} | Price: ${item['Price']} | MA Gap: {item['Max_MA_Dist_%']}% | Box: {item['Price_Box_%']}% | Vol: {item['Avg_Volume']:,}"
+            caption = f"📊 **{item['Ticker']}** | {item['Tier_Label']} | Price: ${item['Price']} | 200 SMA Slope: {item['SMA200_Slope_%']}% | MA Gap: {item['MA_Gap_%']}% | Vol: {item['Avg_Volume']:,}"
             send_to_discord(caption, chart_file)
             if chart_file and os.path.exists(chart_file):
                 try:
@@ -203,7 +195,7 @@ def main():
                 except Exception:
                     pass
     else:
-        send_to_discord("⚠️ No stocks met the strict overlapping squeeze criteria (Min Vol > 2M) today.")
+        send_to_discord("⚠️ No eligible stocks met the price criteria today.")
 
 if __name__ == "__main__":
     main()
