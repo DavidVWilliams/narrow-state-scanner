@@ -16,11 +16,13 @@ from concurrent.futures import ThreadPoolExecutor
 
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
-# --- Scan Settings ---
+# --- Strict Scan Settings ---
 MIN_PRICE = 50.0
 MAX_PRICE = 200.0
 MIN_DAILY_VOLUME = 1_000_000  # Min 1,000,000 shares average daily volume
-TOP_COUNT = 10                # Top 10 Narrow State candidates
+MAX_MA_DIST_PCT = 0.60        # Max avg 20/200 SMA distance over last 45m (%)
+MAX_ATR_PCT = 0.35            # Max avg 14-period ATR over last 45m (%)
+TOP_COUNT = 10                # Max candidates to deliver
 
 def send_to_discord(caption, photo_path=None):
     if not DISCORD_WEBHOOK_URL:
@@ -128,16 +130,26 @@ def scan_ticker(ticker):
         ma_dist_pct = (abs(sma20 - sma200) / close) * 100.0
         atr_pct = (atr14 / close) * 100.0
 
-        # Find the MINIMUM 20/200 SMA squeeze across the last 60 two-minute bars (2 hours)
-        min_ma_dist = float(ma_dist_pct.iloc[-60:].min())
-        latest_atr_pct = float(atr_pct.dropna().iloc[-1])
+        # Evaluate averages over the LAST 45 MINUTES (23 two-minute bars: 3:15 PM - 4:00 PM ET)
+        recent_ma_dist = ma_dist_pct.iloc[-23:]
+        recent_atr = atr_pct.iloc[-23:]
+
+        avg_ma_dist = float(recent_ma_dist.mean())
+        avg_atr_pct = float(recent_atr.mean())
+
+        # Strict Narrow State Filter: MUST satisfy BOTH max distance and max ATR over last 45m
+        if avg_ma_dist > MAX_MA_DIST_PCT or avg_atr_pct > MAX_ATR_PCT:
+            return None
+
+        squeeze_score = round(avg_ma_dist + avg_atr_pct, 4)
 
         return {
             "Ticker": ticker,
             "Price": round(latest_price, 2),
             "Avg_Volume": int(avg_daily_volume),
-            "MA_Dist_%": round(min_ma_dist, 3),
-            "ATR_%": round(latest_atr_pct, 3),
+            "MA_Dist_%": round(avg_ma_dist, 3),
+            "ATR_%": round(avg_atr_pct, 3),
+            "Score": squeeze_score,
             "df": df
         }
     except Exception as e:
@@ -145,7 +157,7 @@ def scan_ticker(ticker):
 
 def main():
     tickers = get_tickers()
-    send_to_discord(f"🔍 **Scanning {len(tickers)} stocks for Top {TOP_COUNT} Afternoon Narrow State Squeezes ($50-$200)...**")
+    send_to_discord(f"🔍 **Scanning {len(tickers)} stocks for 45-Min Closing Squeezes (3:15-4:00 PM ET, $50-$200, Vol > 1M)...**")
 
     results = []
     with ThreadPoolExecutor(max_workers=5) as executor:
@@ -154,14 +166,15 @@ def main():
                 results.append(res)
 
     if results:
-        sorted_results = sorted(results, key=lambda x: x["MA_Dist_%"])
+        # Sort by tightest overall Squeeze Score (MA distance + ATR)
+        sorted_results = sorted(results, key=lambda x: x["Score"])
         top_candidates = sorted_results[:TOP_COUNT]
 
-        send_to_discord(f"🎯 **Top {len(top_candidates)} Narrow State Candidates Today:**")
+        send_to_discord(f"🎯 **Top {len(top_candidates)} Strict Narrow State Candidates (Last 45 Mins):**")
 
         for item in top_candidates:
             chart_file = generate_chart(item['Ticker'], item['df'])
-            caption = f"📊 **{item['Ticker']}** | Price: ${item['Price']} | 20/200 SMA Squeeze Dist: {item['MA_Dist_%']}% | Avg Vol: {item['Avg_Volume']:,}"
+            caption = f"📊 **{item['Ticker']}** | Price: ${item['Price']} | 45m Avg SMA Dist: {item['MA_Dist_%']}% | Avg ATR: {item['ATR_%']}% | Vol: {item['Avg_Volume']:,}"
             send_to_discord(caption, chart_file)
             if chart_file and os.path.exists(chart_file):
                 try:
@@ -169,7 +182,7 @@ def main():
                 except Exception:
                     pass
     else:
-        send_to_discord("⚠️ No eligible stocks met the criteria today.")
+        send_to_discord("⚠️ No stocks met the strict 45-minute Narrow State criteria today.")
 
 if __name__ == "__main__":
     main()
