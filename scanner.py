@@ -20,7 +20,7 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 MIN_PRICE = 50.0
 MAX_PRICE = 200.0
 MIN_DAILY_VOLUME = 2_000_000  # Minimum 2 Million shares average daily volume
-TOP_COUNT = 10                # Max candidates to deliver
+TOP_COUNT = 10                # Deliver Top 10 candidates
 
 def send_to_discord(caption, photo_path=None):
     if not DISCORD_WEBHOOK_URL:
@@ -122,55 +122,62 @@ def scan_ticker(ticker):
         sma20 = close.rolling(20).mean()
         sma200 = close.rolling(200).mean()
 
+        tr = np.maximum(high - low, np.maximum(abs(high - close.shift(1)), abs(low - close.shift(1))))
+        atr14 = tr.rolling(14).mean()
+
         ma_dist_pct = (abs(sma20 - sma200) / close) * 100.0
 
-        # Slopes over closing 30 minutes
-        sma200_slope = float(abs(sma200.iloc[-1] - sma200.iloc[-30]) / latest_price * 100)
-        sma20_slope = float(abs(sma20.iloc[-1] - sma20.iloc[-15]) / latest_price * 100)
-
-        # MA Gap and Closing Box (last 10-15 bars)
-        closing_ma_gap = float(ma_dist_pct.iloc[-10:].mean())
-        closing_box_pct = float((high.iloc[-10:].max() - low.iloc[-10:].min()) / latest_price * 100)
-        price_to_200_gap = float(abs(latest_price - sma200.iloc[-1]) / latest_price * 100)
-
-        # Proximity Baseline: MA Gap <= 0.25% & Price near 200 SMA <= 0.35%
-        if closing_ma_gap > 0.25 or price_to_200_gap > 0.35:
+        # 1. 200 SMA 2-Hour Slope (Must be flat: <= 0.08%) -> Hard rejects CL and O
+        sma200_2h_slope = float(abs(sma200.iloc[-1] - sma200.iloc[-60]) / latest_price * 100)
+        if sma200_2h_slope > 0.08:
             return None
 
-        is_flat_200 = sma200_slope <= 0.08
-        is_flat_20 = sma20_slope <= 0.08
-        is_tight_box = closing_box_pct <= 0.20
+        # 2. Closing MA Gap (last 10 bars: <= 0.18%) -> Hard rejects CCI
+        closing_ma_gap = float(ma_dist_pct.iloc[-10:].mean())
+        if closing_ma_gap > 0.18:
+            return None
 
-        # 🔥 Tier 1 (Best): Flat 200 AND Flat 20 AND Tight Bars
-        if is_flat_200 and is_flat_20 and is_tight_box:
+        # 3. Price to 200 SMA Gap at close (<= 0.20%)
+        price_to_200_gap = float(abs(latest_price - sma200.iloc[-1]) / latest_price * 100)
+        if price_to_200_gap > 0.20:
+            return None
+
+        # 4. Final 15-Minute Volatility Box relative to ATR (Hard rejects CRM & O late dumps)
+        closing_box_raw = float(high.iloc[-8:].max() - low.iloc[-8:].min())
+        latest_atr = float(atr14.iloc[-1])
+        box_to_atr_ratio = closing_box_raw / latest_atr if latest_atr > 0 else 999.0
+        if box_to_atr_ratio > 3.5:  # Rejects stocks where late 15m box is >3.5x normal bar volatility
+            return None
+
+        sma20_slope = float(abs(sma20.iloc[-1] - sma20.iloc[-15]) / latest_price * 100)
+
+        is_flat_20 = sma20_slope <= 0.10
+
+        if is_flat_20:
             tier_num = 1
-            tier_label = "🔥 Tier 1: Perfect Flat 200 & 20 Squeeze (Best)"
-
-        # ⚡ Tier 2 (OK): Flat 200 with Trending 20
-        elif is_flat_200 and closing_ma_gap <= 0.15:
-            tier_num = 2
-            tier_label = "⚡ Tier 2: Flat 200 Magnet Squeeze (OK)"
-
-        # ⏱️ Tier 3 (OK Sloping 200 Exception): Sloping 200, BUT Flat 20 & Tight Overlapping Bars
-        elif (not is_flat_200) and is_flat_20 and is_tight_box:
-            tier_num = 3
-            tier_label = "⏱️ Tier 3: Sloping 200 + Flat 20 & Tight Bars (OK)"
-
+            tier_label = "🔥 Tier 1: Perfect Flat 200 & 20 Pin"
         else:
-            return None  # Rejects uncoordinated/volatile setups
+            tier_num = 2
+            tier_label = "⚡ Tier 2: Flat 200 Magnet Squeeze"
 
-        score = round((3.0 * sma200_slope) + (2.0 * closing_ma_gap) + closing_box_pct, 4)
+        # ATR-normalized score (prevents high-share-price stocks like PLTR from being penalized)
+        squeeze_score = round(
+            (5.0 * sma200_2h_slope) + 
+            (4.0 * closing_ma_gap) + 
+            (3.0 * price_to_200_gap) + 
+            (1.0 * (closing_box_raw / latest_price * 100)), 4
+        )
 
         return {
             "Ticker": ticker,
             "Price": round(latest_price, 2),
             "Avg_Volume": int(avg_daily_volume),
-            "SMA200_Slope_%": round(sma200_slope, 4),
+            "SMA200_Slope_%": round(sma200_2h_slope, 4),
             "MA_Gap_%": round(closing_ma_gap, 3),
-            "Closing_Box_%": round(closing_box_pct, 3),
+            "Price_200_Gap_%": round(price_to_200_gap, 3),
             "Tier_Num": tier_num,
             "Tier_Label": tier_label,
-            "Score": score,
+            "Score": squeeze_score,
             "df": df
         }
     except Exception as e:
@@ -178,7 +185,7 @@ def scan_ticker(ticker):
 
 def main():
     tickers = get_tickers()
-    send_to_discord(f"🔍 **Scanning {len(tickers)} stocks for Oliver Velez Multi-Tier Narrow State Squeezes...**")
+    send_to_discord(f"🔍 **Scanning {len(tickers)} stocks for Pristine Oliver Velez Squeezes...**")
 
     results = []
     with ThreadPoolExecutor(max_workers=5) as executor:
@@ -190,11 +197,11 @@ def main():
         sorted_results = sorted(results, key=lambda x: (x["Tier_Num"], x["Score"]))
         top_candidates = sorted_results[:TOP_COUNT]
 
-        send_to_discord(f"🎯 **Found {len(top_candidates)} Categorized Oliver Velez Candidates:**")
+        send_to_discord(f"🎯 **Found {len(top_candidates)} Pristine Oliver Velez Narrow State Candidates:**")
 
         for item in top_candidates:
             chart_file = generate_chart(item['Ticker'], item['df'], item['Tier_Label'])
-            caption = f"📊 **{item['Ticker']}** | {item['Tier_Label']} | Price: ${item['Price']} | MA Gap: {item['MA_Gap_%']}% | Box: {item['Closing_Box_%']}% | Vol: {item['Avg_Volume']:,}"
+            caption = f"📊 **{item['Ticker']}** | {item['Tier_Label']} | Price: ${item['Price']} | 2H 200 Slope: {item['SMA200_Slope_%']}% | MA Gap: {item['MA_Gap_%']}% | Vol: {item['Avg_Volume']:,}"
             send_to_discord(caption, chart_file)
             if chart_file and os.path.exists(chart_file):
                 try:
@@ -202,7 +209,7 @@ def main():
                 except Exception:
                     pass
     else:
-        send_to_discord("ℹ️ No stocks met the multi-tier Oliver Velez criteria today.")
+        send_to_discord("ℹ️ No stocks met the pristine Oliver Velez criteria today.")
 
 if __name__ == "__main__":
     main()
