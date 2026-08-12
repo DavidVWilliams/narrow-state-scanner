@@ -11,8 +11,6 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
 MIN_PRICE = 50.0
 MAX_PRICE = 200.0
-MAX_MA_DIST_PCT = 1.0   # Max % distance between 20 SMA & 200 SMA
-MAX_ATR_PCT = 0.50      # Max 14-period ATR (%)
 
 def send_to_discord(caption, photo_path=None):
     if not DISCORD_WEBHOOK_URL:
@@ -44,7 +42,7 @@ def generate_chart(ticker, df):
         chart_data,
         type='candle',
         style='yahoo',
-        title=f"\n{ticker} - 2M Narrow State",
+        title=f"\n{ticker} - 2M Chart (20 & 200 SMA)",
         addplot=add_plots,
         savefig=filename
     )
@@ -61,7 +59,6 @@ def get_tickers():
 
 def scan_ticker(ticker):
     try:
-        # yf.Ticker().history() provides clean 1D Series columns
         t_obj = yf.Ticker(ticker)
         df = t_obj.history(period="5d", interval="2m")
         if df.empty or len(df) < 200:
@@ -84,25 +81,21 @@ def scan_ticker(ticker):
         ma_dist_pct = (abs(sma20 - sma200) / close) * 100.0
         atr_pct = (atr14 / close) * 100.0
 
-        narrow_mask = (ma_dist_pct <= MAX_MA_DIST_PCT) & (atr_pct <= MAX_ATR_PCT)
-
-        # Check if Narrow State condition occurred in recent bars
-        if bool(narrow_mask.iloc[-60:].any()):
-            chart_file = generate_chart(ticker, df)
-            return {
-                "Ticker": ticker,
-                "Price": round(latest_price, 2),
-                "MA_Dist_%": round(float(ma_dist_pct.iloc[-1]), 3),
-                "Chart": chart_file
-            }
+        chart_file = generate_chart(ticker, df)
+        return {
+            "Ticker": ticker,
+            "Price": round(latest_price, 2),
+            "MA_Dist_%": round(float(ma_dist_pct.iloc[-1]), 3),
+            "ATR_%": round(float(atr_pct.iloc[-1]), 3),
+            "Chart": chart_file
+        }
     except Exception as e:
         print(f"Error scanning {ticker}: {e}")
         return None
-    return None
 
 def main():
     tickers = get_tickers()
-    send_to_discord(f"🔍 **Starting Daily Post-Market Narrow State Scan ({len(tickers)} stocks)...**")
+    send_to_discord(f"🔍 **Scanning S&P 500 for Top 5 Narrowest 20/200 SMA Squeezes ($50-$200)...**")
 
     results = []
     with ThreadPoolExecutor(max_workers=10) as executor:
@@ -111,14 +104,21 @@ def main():
                 results.append(res)
 
     if results:
-        send_to_discord(f"✅ **Found {len(results)} Narrow State Candidate(s):**")
-        for item in results:
-            caption = f"📊 **{item['Ticker']}** | Price: ${item['Price']} | 20/200 SMA Dist: {item['MA_Dist_%']}%"
+        # Sort stocks by smallest 20/200 SMA distance (narrowest state)
+        sorted_results = sorted(results, key=lambda x: x["MA_Dist_%"])
+        top_candidates = sorted_results[:5]
+
+        send_to_discord(f"🎯 **Top {len(top_candidates)} Narrow State Candidates Today:**")
+        for item in top_candidates:
+            caption = f"📊 **{item['Ticker']}** | Price: ${item['Price']} | 20/200 SMA Dist: {item['MA_Dist_%']}% | ATR: {item['ATR_%']}%"
             send_to_discord(caption, item['Chart'])
+
+        # Clean up generated image files
+        for item in results:
             if os.path.exists(item['Chart']):
                 os.remove(item['Chart'])
     else:
-        send_to_discord("ℹ️ No stocks met the Narrow State criteria today.")
+        send_to_discord("⚠️ Unable to fetch market data at this time.")
 
 if __name__ == "__main__":
     main()
