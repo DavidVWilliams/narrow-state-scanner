@@ -1,9 +1,14 @@
 import os
 import requests
 import pandas as pd
-import yfinance as yf
 import numpy as np
+
+# Force headless rendering backend for GitHub Actions Linux runner
+import matplotlib
+matplotlib.use('Agg')
 import mplfinance as mpf
+
+import yfinance as yf
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
@@ -50,18 +55,20 @@ def generate_chart(ticker, df):
 
 def get_tickers():
     try:
-        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        table = pd.read_html(url)[0]
-        tickers = table['Symbol'].tolist()
+        # Public S&P 500 CSV dataset (prevents Wikipedia HTTP 403 blocks)
+        url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
+        df = pd.read_csv(url)
+        tickers = df['Symbol'].tolist()
         return [t.replace('.', '-') for t in tickers]
-    except Exception:
-        return ["AAPL", "MSFT", "NVDA", "AMD", "AMZN", "META", "GOOGL", "TSLA"]
+    except Exception as e:
+        print(f"Error fetching ticker list: {e}")
+        return ["AMD", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "INTC", "PYPL", "QCOM", "TXN"]
 
 def scan_ticker(ticker):
     try:
         t_obj = yf.Ticker(ticker)
         df = t_obj.history(period="5d", interval="2m")
-        if df.empty or len(df) < 200:
+        if df.empty or len(df) < 150:
             return None
 
         close = df['Close']
@@ -85,8 +92,8 @@ def scan_ticker(ticker):
         return {
             "Ticker": ticker,
             "Price": round(latest_price, 2),
-            "MA_Dist_%": round(float(ma_dist_pct.iloc[-1]), 3),
-            "ATR_%": round(float(atr_pct.iloc[-1]), 3),
+            "MA_Dist_%": round(float(ma_dist_pct.dropna().iloc[-1]), 3),
+            "ATR_%": round(float(atr_pct.dropna().iloc[-1]), 3),
             "Chart": chart_file
         }
     except Exception as e:
@@ -98,13 +105,12 @@ def main():
     send_to_discord(f"🔍 **Scanning S&P 500 for Top 5 Narrowest 20/200 SMA Squeezes ($50-$200)...**")
 
     results = []
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with ThreadPoolExecutor(max_workers=5) as executor:
         for res in executor.map(scan_ticker, tickers):
             if res:
                 results.append(res)
 
     if results:
-        # Sort stocks by smallest 20/200 SMA distance (narrowest state)
         sorted_results = sorted(results, key=lambda x: x["MA_Dist_%"])
         top_candidates = sorted_results[:5]
 
@@ -113,12 +119,14 @@ def main():
             caption = f"📊 **{item['Ticker']}** | Price: ${item['Price']} | 20/200 SMA Dist: {item['MA_Dist_%']}% | ATR: {item['ATR_%']}%"
             send_to_discord(caption, item['Chart'])
 
-        # Clean up generated image files
         for item in results:
             if os.path.exists(item['Chart']):
-                os.remove(item['Chart'])
+                try:
+                    os.remove(item['Chart'])
+                except Exception:
+                    pass
     else:
-        send_to_discord("⚠️ Unable to fetch market data at this time.")
+        send_to_discord("⚠️ No eligible stocks met the price criteria today.")
 
 if __name__ == "__main__":
     main()
