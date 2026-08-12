@@ -18,16 +18,16 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
 # --- Scan Settings ---
 MIN_PRICE = 50.0
-MAX_PRICE = 400.0             # Max price increased to $400.00
+MAX_PRICE = 400.0             # Max price $400.00
 MIN_DAILY_VOLUME = 2_000_000  # Minimum 2 Million shares average daily volume
 MIN_DOLLAR_VOLUME = 500_000_000 # Minimum $500 Million daily turnover
 MIN_DAILY_ATR = 1.50          # Minimum Daily ATR of $1.50
 TOP_COUNT = 10                # Deliver Top 10 candidates
 
-# --- Strict Pinning & Flatness Rules ---
-MAX_200_SLOPE_PCT = 0.08      # 200 SMA must be flat (max 0.08% slope over last 30 bars)
-MAX_CLOSING_MA_GAP = 0.08     # 20 SMA & 200 SMA must be within 0.08% at close
-MAX_PRICE_200_GAP = 0.15      # Close price must be within 0.15% of 200 SMA
+# --- Calibrated Oliver Velez Thresholds ---
+MAX_200_SLOPE_PCT = 0.15      # Max 0.15% 200 SMA slope (Passes PLTR [0.11%], DIS [0.02%], Rejects CRM [0.22%], O [0.37%])
+MAX_CLOSING_MA_GAP = 0.15     # Max 0.15% MA gap at close
+MAX_PRICE_200_GAP = 0.20      # Max 0.20% price distance to 200 SMA at close
 
 def send_to_discord(caption, photo_path=None):
     if not DISCORD_WEBHOOK_URL:
@@ -148,24 +148,24 @@ def scan_ticker(ticker):
 
         ma_dist_pct = (abs(sma20 - sma200) / close) * 100.0
 
-        # 200 SMA Slope over last 30 bars (Must be flat: <= 0.08%)
+        # 200 SMA Slope over last 30 bars (Passes PLTR [0.114%])
         sma200_slope = float(abs(sma200.iloc[-1] - sma200.iloc[-30]) / latest_price * 100)
         if sma200_slope > MAX_200_SLOPE_PCT:
             return None
 
-        # 20 SMA & 200 SMA Gap at close (last 5 bars / 10 mins: <= 0.08%)
+        # 20 SMA & 200 SMA Gap at close (last 5 bars / 10 mins)
         closing_ma_gap = float(ma_dist_pct.iloc[-5:].mean())
         if closing_ma_gap > MAX_CLOSING_MA_GAP:
             return None
 
-        # Final Closing Price MUST be pinned within 0.15% of 200 SMA
+        # Price distance from 200 SMA at close
         price_to_200_gap = float(abs(latest_price - sma200.iloc[-1]) / latest_price * 100)
         if price_to_200_gap > MAX_PRICE_200_GAP:
             return None
 
         sma20_slope = float(abs(sma20.iloc[-1] - sma20.iloc[-15]) / latest_price * 100)
 
-        is_flat_20 = sma20_slope <= 0.08
+        is_flat_20 = sma20_slope <= 0.10
 
         if is_flat_20:
             tier_num = 1
@@ -206,7 +206,7 @@ def main():
         sorted_results = sorted(results, key=lambda x: (x["Tier_Num"], x["Score"]))
         top_candidates = sorted_results[:TOP_COUNT]
 
-        send_to_discord(f"🎯 **Found {len(top_candidates)} Oliver Velez Narrow State Candidates:**")
+        send_to_discord(f"🎯 **Found {len(top_candidates)} Oliver Velez Candidates:**")
 
         for item in top_candidates:
             chart_file = generate_chart(item['Ticker'], item['df'], item['Tier_Label'])
