@@ -25,7 +25,7 @@ TOP_COUNT = 10                # Deliver Top 10 candidates
 # --- Strict Pinning & Flatness Rules ---
 MAX_200_SLOPE_PCT = 0.08      # 200 SMA must be flat (max 0.08% slope over last 30 bars)
 MAX_CLOSING_MA_GAP = 0.08     # 20 SMA & 200 SMA must be within 0.08% at close
-MAX_PRICE_200_GAP = 0.15      # Close price must be within 0.15% of 200 SMA (Passes PLTR, Rejects CRM)
+MAX_PRICE_200_GAP = 0.15      # Close price must be within 0.15% of 200 SMA
 
 def send_to_discord(caption, photo_path=None):
     if not DISCORD_WEBHOOK_URL:
@@ -107,7 +107,8 @@ def get_tickers():
 def scan_ticker(ticker):
     try:
         t_obj = yf.Ticker(ticker)
-        df = t_obj.history(period="5d", interval="2m")
+        # prepost=False strips pre-market & after-hours data, preserving strictly 9:30 AM - 4:00 PM ET
+        df = t_obj.history(period="5d", interval="2m", prepost=False)
         if df.empty or len(df) < 200:
             return None
 
@@ -127,17 +128,17 @@ def scan_ticker(ticker):
 
         ma_dist_pct = (abs(sma20 - sma200) / close) * 100.0
 
-        # 1. 200 SMA Slope over last 30 bars (Must be flat: <= 0.08%)
+        # 1. 200 SMA Slope over last 30 bars of regular trading hours
         sma200_slope = float(abs(sma200.iloc[-1] - sma200.iloc[-30]) / latest_price * 100)
         if sma200_slope > MAX_200_SLOPE_PCT:
             return None
 
-        # 2. 20 SMA & 200 SMA Gap at close (last 5 bars / 10 mins: <= 0.08%)
+        # 2. 20 SMA & 200 SMA Gap at 4:00 PM market close (last 5 bars / 10 mins: <= 0.08%)
         closing_ma_gap = float(ma_dist_pct.iloc[-5:].mean())
         if closing_ma_gap > MAX_CLOSING_MA_GAP:
             return None
 
-        # 3. Final Closing Price MUST be pinned within 0.15% of the 200 SMA (Passes PLTR, Rejects CRM)
+        # 3. 4:00 PM Market Close Price MUST be pinned within 0.15% of 200 SMA
         price_to_200_gap = float(abs(latest_price - sma200.iloc[-1]) / latest_price * 100)
         if price_to_200_gap > MAX_PRICE_200_GAP:
             return None
@@ -172,7 +173,7 @@ def scan_ticker(ticker):
 
 def main():
     tickers = get_tickers()
-    send_to_discord(f"🔍 **Scanning {len(tickers)} stocks for Pinned Oliver Velez Squeezes...**")
+    send_to_discord(f"🔍 **Scanning {len(tickers)} stocks for Regular Hours Pinned Squeezes...**")
 
     results = []
     with ThreadPoolExecutor(max_workers=5) as executor:
@@ -184,7 +185,7 @@ def main():
         sorted_results = sorted(results, key=lambda x: (x["Tier_Num"], x["Score"]))
         top_candidates = sorted_results[:TOP_COUNT]
 
-        send_to_discord(f"🎯 **Found {len(top_candidates)} Pinned Oliver Velez Narrow State Candidates:**")
+        send_to_discord(f"🎯 **Found {len(top_candidates)} Regular Hours Oliver Velez Candidates:**")
 
         for item in top_candidates:
             chart_file = generate_chart(item['Ticker'], item['df'], item['Tier_Label'])
@@ -196,7 +197,7 @@ def main():
                 except Exception:
                     pass
     else:
-        send_to_discord("ℹ️ No stocks met the pinned Oliver Velez criteria today.")
+        send_to_discord("ℹ️ No stocks met the criteria today.")
 
 if __name__ == "__main__":
     main()
