@@ -1,4 +1,5 @@
 import os
+import json
 import requests
 import pandas as pd
 import numpy as np
@@ -25,19 +26,36 @@ def send_to_discord(caption, photo_path=None):
     
     try:
         if photo_path and os.path.exists(photo_path):
+            filename = os.path.basename(photo_path)
             with open(photo_path, "rb") as photo:
-                files = {"file": (os.path.basename(photo_path), photo, "image/png")}
-                payload = {"content": caption}
-                res = requests.post(DISCORD_WEBHOOK_URL, data=payload, files=files)
+                # Discord API v10 requires explicit attachment mapping
+                files = {
+                    "files[0]": (filename, photo, "image/png")
+                }
+                payload = {
+                    "content": caption,
+                    "attachments": [
+                        {
+                            "id": 0,
+                            "filename": filename
+                        }
+                    ]
+                }
+                res = requests.post(
+                    DISCORD_WEBHOOK_URL,
+                    data={"payload_json": json.dumps(payload)},
+                    files=files
+                )
                 print(f"Discord Upload Response: {res.status_code}")
         else:
-            requests.post(DISCORD_WEBHOOK_URL, json={"content": caption})
+            res = requests.post(DISCORD_WEBHOOK_URL, json={"content": caption})
+            print(f"Discord Text Response: {res.status_code}")
     except Exception as e:
         print(f"Error sending to Discord: {e}")
 
 def generate_chart(ticker, df):
     try:
-        # Calculate SMAs on full dataset FIRST so 200 SMA is valid
+        # Calculate SMAs on full dataset FIRST
         df_calc = df.copy()
         df_calc['SMA20'] = df_calc['Close'].rolling(20).mean()
         df_calc['SMA200'] = df_calc['Close'].rolling(200).mean()
