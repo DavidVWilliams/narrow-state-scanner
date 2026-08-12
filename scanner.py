@@ -6,6 +6,7 @@ import numpy as np
 # Force headless rendering backend for GitHub Actions Linux runner
 import matplotlib
 matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 import mplfinance as mpf
 
 import yfinance as yf
@@ -19,7 +20,7 @@ MAX_PRICE = 200.0
 
 def send_to_discord(caption, photo_path=None):
     if not DISCORD_WEBHOOK_URL:
-        print("No DISCORD_WEBHOOK_URL set. Skipping notification.")
+        print(f"NO WEBHOOK URL: {caption}")
         return
     
     try:
@@ -34,34 +35,38 @@ def send_to_discord(caption, photo_path=None):
         print(f"Error sending to Discord: {e}")
 
 def generate_chart(ticker, df):
-    chart_data = df.tail(120).copy()
-    sma20 = chart_data['Close'].rolling(20).mean()
-    sma200 = chart_data['Close'].rolling(200).mean()
+    try:
+        chart_data = df.tail(120).copy()
+        sma20 = chart_data['Close'].rolling(20).mean()
+        sma200 = chart_data['Close'].rolling(200).mean()
 
-    add_plots = [
-        mpf.make_addplot(sma20, color='blue', width=1.5),
-        mpf.make_addplot(sma200, color='green', width=2.0)
-    ]
-    filename = f"{ticker}_2m.png"
-    mpf.plot(
-        chart_data,
-        type='candle',
-        style='yahoo',
-        title=f"\n{ticker} - 2M Chart (20 & 200 SMA)",
-        addplot=add_plots,
-        savefig=filename
-    )
-    return filename
+        add_plots = [
+            mpf.make_addplot(sma20, color='blue', width=1.5),
+            mpf.make_addplot(sma200, color='green', width=2.0)
+        ]
+        filename = f"{ticker}_2m.png"
+        mpf.plot(
+            chart_data,
+            type='candle',
+            style='yahoo',
+            title=f"\n{ticker} - 2M Chart (20 SMA Blue / 200 SMA Green)",
+            addplot=add_plots,
+            savefig=filename
+        )
+        plt.close('all')
+        return filename
+    except Exception as e:
+        print(f"Chart generation error for {ticker}: {e}")
+        return None
 
 def get_tickers():
     try:
-        # Public S&P 500 CSV dataset (prevents Wikipedia HTTP 403 blocks)
         url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
         df = pd.read_csv(url)
         tickers = df['Symbol'].tolist()
         return [t.replace('.', '-') for t in tickers]
     except Exception as e:
-        print(f"Error fetching ticker list: {e}")
+        print(f"Error fetching tickers: {e}")
         return ["AMD", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "INTC", "PYPL", "QCOM", "TXN"]
 
 def scan_ticker(ticker):
@@ -88,16 +93,17 @@ def scan_ticker(ticker):
         ma_dist_pct = (abs(sma20 - sma200) / close) * 100.0
         atr_pct = (atr14 / close) * 100.0
 
-        chart_file = generate_chart(ticker, df)
+        latest_ma_dist = float(ma_dist_pct.dropna().iloc[-1])
+        latest_atr_pct = float(atr_pct.dropna().iloc[-1])
+
         return {
             "Ticker": ticker,
             "Price": round(latest_price, 2),
-            "MA_Dist_%": round(float(ma_dist_pct.dropna().iloc[-1]), 3),
-            "ATR_%": round(float(atr_pct.dropna().iloc[-1]), 3),
-            "Chart": chart_file
+            "MA_Dist_%": round(latest_ma_dist, 3),
+            "ATR_%": round(latest_atr_pct, 3),
+            "df": df
         }
     except Exception as e:
-        print(f"Error scanning {ticker}: {e}")
         return None
 
 def main():
@@ -111,18 +117,18 @@ def main():
                 results.append(res)
 
     if results:
+        # Sort stocks by smallest 20/200 SMA distance
         sorted_results = sorted(results, key=lambda x: x["MA_Dist_%"])
         top_candidates = sorted_results[:5]
 
         send_to_discord(f"🎯 **Top {len(top_candidates)} Narrow State Candidates Today:**")
         for item in top_candidates:
+            chart_file = generate_chart(item['Ticker'], item['df'])
             caption = f"📊 **{item['Ticker']}** | Price: ${item['Price']} | 20/200 SMA Dist: {item['MA_Dist_%']}% | ATR: {item['ATR_%']}%"
-            send_to_discord(caption, item['Chart'])
-
-        for item in results:
-            if os.path.exists(item['Chart']):
+            send_to_discord(caption, chart_file)
+            if chart_file and os.path.exists(chart_file):
                 try:
-                    os.remove(item['Chart'])
+                    os.remove(chart_file)
                 except Exception:
                     pass
     else:
