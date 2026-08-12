@@ -20,7 +20,7 @@ jobs:
 
       - name: Install Libraries
         run: |
-          pip install yfinance pandas numpy lxml mplfinance requests
+          pip install yfinance pandas numpy lxml mplfinance requests pillow
 
       - name: Run Scanner
         env:
