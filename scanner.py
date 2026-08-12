@@ -22,13 +22,7 @@ MAX_PRICE = 400.0             # Max price $400.00
 MIN_DAILY_VOLUME = 2_000_000  # Minimum 2 Million shares average daily volume
 MIN_DOLLAR_VOLUME = 500_000_000 # Minimum $500 Million daily turnover
 MIN_DAILY_ATR = 1.50          # Minimum Daily ATR of $1.50
-TOP_COUNT = 10                # Deliver Top 10 candidates
-
-# --- Strict Oliver Velez Stability Rules ---
-MAX_200_SLOPE_PCT = 0.12      # 200 SMA must be flat (max 0.12% slope)
-MAX_CLOSING_10M_RETURN = 0.15 # Final 10-min price change <= 0.15% (Rejects WFC late drops)
-MAX_CLOSING_MA_GAP = 0.10     # 20 SMA & 200 SMA gap <= 0.10% at close
-MAX_PRICE_200_GAP = 0.15      # Close price within 0.15% of 200 SMA
+TOP_COUNT = 15                # Delivered candidate limit increased to 15
 
 def send_to_discord(caption, photo_path=None):
     if not DISCORD_WEBHOOK_URL:
@@ -111,9 +105,10 @@ def scan_ticker(ticker):
     try:
         t_obj = yf.Ticker(ticker)
         
-        # 1. Daily ATR Check
+        # 1. Daily ATR check
         df_daily = t_obj.history(period="1mo", interval="1d")
         if df_daily.empty or len(df_daily) < 14:
+            if ticker == "PLTR": send_to_discord("⚠️ PLTR Debug: Daily data empty")
             return None
             
         d_tr = np.maximum(
@@ -122,11 +117,13 @@ def scan_ticker(ticker):
         )
         daily_atr = float(d_tr.rolling(14).mean().iloc[-1])
         if daily_atr < MIN_DAILY_ATR:
+            if ticker == "PLTR": send_to_discord(f"⚠️ PLTR Debug: Daily ATR ${daily_atr:.2f} < ${MIN_DAILY_ATR}")
             return None
 
-        # 2. Intraday 2m data (RTH only)
+        # 2. Intraday 2m data
         df = t_obj.history(period="7d", interval="2m", prepost=False)
         if df.empty or len(df) < 50:
+            if ticker == "PLTR": send_to_discord("⚠️ PLTR Debug: Intraday 2m data empty")
             return None
 
         close = df['Close']
@@ -134,14 +131,17 @@ def scan_ticker(ticker):
 
         latest_price = float(close.iloc[-1])
         if not (MIN_PRICE <= latest_price <= MAX_PRICE):
+            if ticker == "PLTR": send_to_discord(f"⚠️ PLTR Debug: Price ${latest_price} out of range")
             return None
 
         avg_daily_volume = float(volume.resample('1D').sum().mean())
         if avg_daily_volume < MIN_DAILY_VOLUME:
+            if ticker == "PLTR": send_to_discord("⚠️ PLTR Debug: Volume too low")
             return None
 
         avg_dollar_volume = latest_price * avg_daily_volume
         if avg_dollar_volume < MIN_DOLLAR_VOLUME:
+            if ticker == "PLTR": send_to_discord("⚠️ PLTR Debug: Dollar volume too low")
             return None
 
         sma20 = close.rolling(20).mean()
@@ -149,29 +149,21 @@ def scan_ticker(ticker):
 
         ma_dist_pct = (abs(sma20 - sma200) / close) * 100.0
 
-        # 1. 200 SMA Slope over last 30 bars (Must be flat: <= 0.12%)
         sma200_slope = float(abs(sma200.iloc[-1] - sma200.iloc[-30]) / latest_price * 100)
-        if sma200_slope > MAX_200_SLOPE_PCT:
-            return None
-
-        # 2. Final 10-Minute Price Change (Hard rejects WFC late drops/spikes)
-        closing_10m_return = float(abs(close.iloc[-1] - close.iloc[-6]) / close.iloc[-6] * 100)
-        if closing_10m_return > MAX_CLOSING_10M_RETURN:
-            return None
-
-        # 3. 20 SMA & 200 SMA Gap at close (last 5 bars / 10 mins: <= 0.10%)
         closing_ma_gap = float(ma_dist_pct.iloc[-5:].mean())
-        if closing_ma_gap > MAX_CLOSING_MA_GAP:
-            return None
-
-        # 4. Final Close Price MUST be within 0.15% of 200 SMA
         price_to_200_gap = float(abs(latest_price - sma200.iloc[-1]) / latest_price * 100)
-        if price_to_200_gap > MAX_PRICE_200_GAP:
+
+        # PLTR Status Report
+        if ticker == "PLTR":
+            send_to_discord(f"📊 **PLTR Status**: Price: ${latest_price:.2f} | Daily ATR: ${daily_atr:.2f} | 200 Slope: {sma200_slope:.4f}% | MA Gap: {closing_ma_gap:.3f}% | Price/200 Gap: {price_to_200_gap:.3f}%")
+
+        if sma200_slope > 0.20 or closing_ma_gap > 0.25 or price_to_200_gap > 0.30:
+            if ticker == "PLTR": send_to_discord("⚠️ PLTR Debug: Failed slope/gap filter")
             return None
 
         sma20_slope = float(abs(sma20.iloc[-1] - sma20.iloc[-15]) / latest_price * 100)
 
-        is_flat_20 = sma20_slope <= 0.08
+        is_flat_20 = sma20_slope <= 0.10
 
         if is_flat_20:
             tier_num = 1
@@ -180,7 +172,7 @@ def scan_ticker(ticker):
             tier_num = 2
             tier_label = "⚡ Tier 2: Flat 200 Magnet Squeeze"
 
-        squeeze_score = round((5.0 * sma200_slope) + (4.0 * closing_ma_gap) + (3.0 * price_to_200_gap) + (2.0 * closing_10m_return), 4)
+        squeeze_score = round((5.0 * sma200_slope) + (4.0 * closing_ma_gap) + (3.0 * price_to_200_gap), 4)
 
         return {
             "Ticker": ticker,
@@ -196,11 +188,12 @@ def scan_ticker(ticker):
             "df": df
         }
     except Exception as e:
+        if ticker == "PLTR": send_to_discord(f"❌ PLTR Exception: {e}")
         return None
 
 def main():
     tickers = get_tickers()
-    send_to_discord(f"🔍 **Scanning {len(tickers)} stocks for Stable Oliver Velez Pinned Squeezes...**")
+    send_to_discord(f"🔍 **Scanning {len(tickers)} stocks ($50-$400, Vol > 2M, Daily ATR > $1.50)...**")
 
     results = []
     with ThreadPoolExecutor(max_workers=5) as executor:
@@ -212,7 +205,7 @@ def main():
         sorted_results = sorted(results, key=lambda x: (x["Tier_Num"], x["Score"]))
         top_candidates = sorted_results[:TOP_COUNT]
 
-        send_to_discord(f"🎯 **Found {len(top_candidates)} Stable Oliver Velez Candidates:**")
+        send_to_discord(f"🎯 **Found {len(top_candidates)} Candidates (Top {TOP_COUNT} Delivered):**")
 
         for item in top_candidates:
             chart_file = generate_chart(item['Ticker'], item['df'], item['Tier_Label'])
