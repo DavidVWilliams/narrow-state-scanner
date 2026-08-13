@@ -22,7 +22,7 @@ MIN_PRICE = 50.0
 MAX_PRICE = 400.0
 MIN_DAILY_VOLUME = 2_000_000  # Minimum 2 Million shares (Pure share volume, no dollar bias)
 MIN_DAILY_ATR = 1.50          # Minimum Daily ATR of $1.50
-TOP_COUNT = 10                # Deliver Top 10 candidates
+TOP_COUNT = 50                # Deliver Top 10 candidates
 
 def send_to_discord(caption, photo_path=None):
     if not DISCORD_WEBHOOK_URL:
