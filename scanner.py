@@ -14,15 +14,21 @@ import yfinance as yf
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
-SCRIPT_VERSION = "v2.6"
+SCRIPT_VERSION = "v2.7"
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
-# --- Scan Settings (Price-Neutral) ---
+# --- Scan Settings ---
 MIN_PRICE = 50.0
 MAX_PRICE = 400.0
-MIN_DAILY_VOLUME = 2_000_000  # Minimum 2 Million shares (Pure share volume, no dollar bias)
+MIN_DAILY_VOLUME = 2_000_000  # Minimum 2 Million shares
 MIN_DAILY_ATR = 1.50          # Minimum Daily ATR of $1.50
 TOP_COUNT = 50                # Deliver Top 10 candidates
+
+# --- Strict Oliver Velez Parallel Squeeze Rules (v2.7) ---
+MAX_200_SLOPE_PCT = 0.06      # 200 SMA must be dead-flat (max 0.06% slope in last 30 bars)
+MAX_20_SLOPE_PCT = 0.08       # 20 SMA must be flat (max 0.08% slope in last 15 bars)
+MAX_PARALLEL_MA_GAP = 0.12    # MAs must be parallel (gap <= 0.12% across all 10 closing bars)
+MAX_CLOSING_BOX_PCT = 0.25    # Final 20-min price box <= 0.25% (no 50-cent rollercoaster drops)
 
 def send_to_discord(caption, photo_path=None):
     if not DISCORD_WEBHOOK_URL:
@@ -126,7 +132,6 @@ def scan_ticker(ticker):
         close = df['Close']
         high = df['High']
         low = df['Low']
-        open_p = df['Open']
         volume = df['Volume']
 
         latest_price = float(close.iloc[-1])
@@ -140,49 +145,40 @@ def scan_ticker(ticker):
         sma20 = close.rolling(20).mean()
         sma200 = close.rolling(200).mean()
 
-        tr = np.maximum(high - low, np.maximum(abs(high - close.shift(1)), abs(low - close.shift(1))))
-        atr14 = tr.rolling(14).mean()
-        atr2m = float(atr14.iloc[-1])
-        if atr2m <= 0: return None
+        ma_dist_pct = (abs(sma20 - sma200) / close) * 100.0
 
-        # --- ATR-Normalized Squeeze Metrics (Price-Neutral) ---
-        # 1. MA Gap in cents relative to 2m ATR
-        ma_gap_cents = float(abs(sma20.iloc[-1] - sma200.iloc[-1]))
-        ma_gap_to_atr = ma_gap_cents / atr2m
-
-        # 2. 200 SMA slope relative to Daily ATR
-        sma200_slope_cents = float(abs(sma200.iloc[-1] - sma200.iloc[-30]))
-        sma200_slope_to_atr = sma200_slope_cents / daily_atr
-
-        # 3. 20 SMA slope relative to Daily ATR
-        sma20_slope_cents = float(abs(sma20.iloc[-1] - sma20.iloc[-15]))
-        sma20_slope_to_atr = sma20_slope_cents / daily_atr
-
-        # 4. Price to 200 SMA distance relative to 2m ATR
-        price_to_200_cents = float(abs(latest_price - sma200.iloc[-1]))
-        price_to_200_to_atr = price_to_200_cents / atr2m
-
-        # 5. Candle Body Range in final 15 mins relative to 2m ATR
-        body_high = np.maximum(open_p, close)
-        body_low = np.minimum(open_p, close)
-        body_box_cents = float(body_high.iloc[-8:].max() - body_low.iloc[-8:].min())
-        body_box_to_atr = body_box_cents / atr2m
-
-        # Baseline filters (normalized to ATR)
-        if ma_gap_to_atr > 0.60 or sma200_slope_to_atr > 0.10 or body_box_to_atr > 2.2:
+        # --- Hard Anti-ORLY Rules (v2.7) ---
+        # 1. 200 SMA Slope over last 30 bars (Must be dead flat: <= 0.06%)
+        sma200_slope = float(abs(sma200.iloc[-1] - sma200.iloc[-30]) / latest_price * 100)
+        if sma200_slope > MAX_200_SLOPE_PCT:
             return None
 
-        # --- Strict 5-Point Tier 1 Definition ---
-        is_flat_200 = sma200_slope_to_atr <= 0.04
-        is_flat_20 = sma20_slope_to_atr <= 0.04
-        is_pinned_ma = ma_gap_to_atr <= 0.25
-        is_tight_body = body_box_to_atr <= 1.20
-        is_price_pinned = price_to_200_to_atr <= 0.35
+        # 2. 20 SMA Slope over last 15 bars (Must not be plunging/rocketing: <= 0.08%)
+        sma20_slope = float(abs(sma20.iloc[-1] - sma20.iloc[-15]) / latest_price * 100)
+        if sma20_slope > MAX_20_SLOPE_PCT:
+            return None
 
-        # 🔥 Tier 1: All 5 strict criteria must hold
-        if is_flat_200 and is_flat_20 and is_pinned_ma and is_tight_body and is_price_pinned:
+        # 3. Continuous Parallel MA Gap (Max gap across ALL last 10 bars <= 0.12%, rejects fast X-crosses)
+        max_10bar_ma_gap = float(ma_dist_pct.iloc[-10:].max())
+        if max_10bar_ma_gap > MAX_PARALLEL_MA_GAP:
+            return None
+
+        # 4. Final 20-Minute Price Box (<= 0.25%, rejects 50-cent rollercoaster drops)
+        closing_box_pct = float((high.iloc[-10:].max() - low.iloc[-10:].min()) / latest_price * 100)
+        if closing_box_pct > MAX_CLOSING_BOX_PCT:
+            return None
+
+        price_to_200_gap = float(abs(latest_price - sma200.iloc[-1]) / latest_price * 100)
+        closing_ma_gap = float(ma_dist_pct.iloc[-5:].mean())
+
+        # Categorize setup tier
+        is_flat_200 = sma200_slope <= 0.04
+        is_flat_20 = sma20_slope <= 0.04
+        is_pinned_ma = closing_ma_gap <= 0.05
+
+        if is_flat_200 and is_flat_20 and is_pinned_ma:
             tier_num = 1
-            tier_label = "🔥 Tier 1: Pristine Flat 200 & 20 Squeeze (Best)"
+            tier_label = "🔥 Tier 1: Pristine Parallel Squeeze (Best)"
         elif is_flat_200 and is_pinned_ma:
             tier_num = 2
             tier_label = "⚡ Tier 2: Flat 200 Magnet Squeeze (OK)"
@@ -190,15 +186,16 @@ def scan_ticker(ticker):
             tier_num = 3
             tier_label = "⏱️ Tier 3: Consolidating Squeeze (OK)"
 
-        # Price-neutral squeeze score
-        score = round((4.0 * ma_gap_to_atr) + (3.0 * sma200_slope_to_atr) + (2.0 * price_to_200_to_atr) + body_box_to_atr, 4)
+        score = round((5.0 * sma200_slope) + (4.0 * closing_ma_gap) + (3.0 * price_to_200_gap) + closing_box_pct, 4)
 
         return {
             "Ticker": ticker,
             "Price": round(latest_price, 2),
             "Daily_ATR": round(daily_atr, 2),
             "Avg_Volume": int(avg_daily_volume),
-            "MA_Gap_Cents": round(ma_gap_cents, 2),
+            "SMA200_Slope_%": round(sma200_slope, 4),
+            "MA_Gap_%": round(closing_ma_gap, 3),
+            "Closing_Box_%": round(closing_box_pct, 3),
             "Tier_Num": tier_num,
             "Tier_Label": tier_label,
             "Score": score,
@@ -209,7 +206,7 @@ def scan_ticker(ticker):
 
 def main():
     tickers = get_tickers()
-    send_to_discord(f"🔍 **[{SCRIPT_VERSION}] Scanning {len(tickers)} stocks ($50-$400, Vol > 2M, Price-Neutral ATR Model)...**")
+    send_to_discord(f"🔍 **[{SCRIPT_VERSION}] Scanning {len(tickers)} stocks for True Parallel Squeezes ($50-$400, Vol > 2M)...**")
 
     results = []
     with ThreadPoolExecutor(max_workers=5) as executor:
@@ -221,11 +218,11 @@ def main():
         sorted_results = sorted(results, key=lambda x: (x["Tier_Num"], x["Score"]))
         top_candidates = sorted_results[:TOP_COUNT]
 
-        send_to_discord(f"🎯 **[{SCRIPT_VERSION}] Top {len(top_candidates)} Price-Neutral Narrow State Candidates:**")
+        send_to_discord(f"🎯 **[{SCRIPT_VERSION}] Top {len(top_candidates)} Pristine Narrow State Candidates:**")
 
         for item in top_candidates:
             chart_file = generate_chart(item['Ticker'], item['df'], item['Tier_Label'])
-            caption = f"📊 **{item['Ticker']}** | {item['Tier_Label']} | Price: ${item['Price']} | Daily ATR: ${item['Daily_ATR']} | MA Gap: ${item['MA_Gap_Cents']} | Vol: {item['Avg_Volume']:,}"
+            caption = f"📊 **{item['Ticker']}** | {item['Tier_Label']} | Price: ${item['Price']} | Daily ATR: ${item['Daily_ATR']} | MA Gap: {item['MA_Gap_%']}% | Vol: {item['Avg_Volume']:,}"
             send_to_discord(caption, chart_file)
             if chart_file and os.path.exists(chart_file):
                 try:
@@ -233,7 +230,7 @@ def main():
                 except Exception:
                     pass
     else:
-        send_to_discord(f"ℹ️ [{SCRIPT_VERSION}] No stocks met the criteria today.")
+        send_to_discord(f"ℹ️ [{SCRIPT_VERSION}] No stocks met the true parallel squeeze criteria today.")
 
 if __name__ == "__main__":
     main()
