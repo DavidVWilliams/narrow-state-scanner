@@ -14,21 +14,20 @@ import yfinance as yf
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
-SCRIPT_VERSION = "v2.7"
+SCRIPT_VERSION = "v2.8"
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
 # --- Scan Settings ---
 MIN_PRICE = 50.0
-MAX_PRICE = 400.0
-MIN_DAILY_VOLUME = 2_000_000  # Minimum 2 Million shares
+MAX_PRICE = 400.0             # Price range $50 - $400
+MIN_DAILY_VOLUME = 2_000_000  # Minimum 2 Million shares average daily volume
 MIN_DAILY_ATR = 1.50          # Minimum Daily ATR of $1.50
 TOP_COUNT = 50                # Deliver Top 10 candidates
 
-# --- Strict Oliver Velez Parallel Squeeze Rules (v2.7) ---
-MAX_200_SLOPE_PCT = 0.06      # 200 SMA must be dead-flat (max 0.06% slope in last 30 bars)
-MAX_20_SLOPE_PCT = 0.08       # 20 SMA must be flat (max 0.08% slope in last 15 bars)
-MAX_PARALLEL_MA_GAP = 0.12    # MAs must be parallel (gap <= 0.12% across all 10 closing bars)
-MAX_CLOSING_BOX_PCT = 0.25    # Final 20-min price box <= 0.25% (no 50-cent rollercoaster drops)
+# --- Oliver Velez Squeeze Constraints (v2.8) ---
+MAX_200_SLOPE_PCT = 0.10      # Max 0.10% 200 SMA slope (Passes PLTR, DIS, GOOG)
+MAX_CLOSING_MA_GAP = 0.14     # Max 0.14% gap between 20 SMA & 200 SMA during closing window
+MAX_45M_SWING_PCT = 0.40      # Max 0.40% swing amplitude in last 45m (Hard-rejects wide swings like ORLY)
 
 def send_to_discord(caption, photo_path=None):
     if not DISCORD_WEBHOOK_URL:
@@ -99,13 +98,13 @@ def get_tickers():
         df_sp = pd.read_csv(url)
         sp_tickers = df_sp['Symbol'].tolist()
         
-        extra_tickers = ["PLTR", "DIS", "QQQ", "SPY", "IWM", "TSLA", "NVDA", "AMD", "AMZN", "META", "GOOGL", "AAPL", "MSFT", "SOFI", "HOOD", "UBER", "ABNB", "COIN", "MARA", "RIOT", "DKNG", "SNAP", "SQ", "SHOP", "RBLX", "PALO"]
+        extra_tickers = ["GOOG", "PLTR", "DIS", "QQQ", "SPY", "IWM", "TSLA", "NVDA", "AMD", "AMZN", "META", "AAPL", "MSFT", "SOFI", "HOOD", "UBER", "ABNB", "COIN", "MARA", "RIOT", "DKNG", "SNAP", "SQ", "SHOP", "RBLX", "PALO"]
         
         all_tickers = list(set(sp_tickers + extra_tickers))
         return [t.replace('.', '-') for t in all_tickers]
     except Exception as e:
         print(f"Error fetching tickers: {e}")
-        return ["PLTR", "DIS", "AMD", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "INTC", "PYPL", "QCOM"]
+        return ["GOOG", "PLTR", "DIS", "AMD", "NVDA", "AMZN", "META", "TSLA", "INTC", "PYPL", "QCOM"]
 
 def scan_ticker(ticker):
     try:
@@ -130,8 +129,7 @@ def scan_ticker(ticker):
             return None
 
         close = df['Close']
-        high = df['High']
-        low = df['Low']
+        open_p = df['Open']
         volume = df['Volume']
 
         latest_price = float(close.iloc[-1])
@@ -147,46 +145,41 @@ def scan_ticker(ticker):
 
         ma_dist_pct = (abs(sma20 - sma200) / close) * 100.0
 
-        # --- Hard Anti-ORLY Rules (v2.7) ---
-        # 1. 200 SMA Slope over last 30 bars (Must be dead flat: <= 0.06%)
+        # 1. 200 SMA Slope over last 30 bars (Must be flat: <= 0.10%)
         sma200_slope = float(abs(sma200.iloc[-1] - sma200.iloc[-30]) / latest_price * 100)
         if sma200_slope > MAX_200_SLOPE_PCT:
             return None
 
-        # 2. 20 SMA Slope over last 15 bars (Must not be plunging/rocketing: <= 0.08%)
+        # 2. MA Gap during closing window (last 15 bars: <= 0.14%)
+        closing_ma_gap = float(ma_dist_pct.iloc[-15:].mean())
+        if closing_ma_gap > MAX_CLOSING_MA_GAP:
+            return None
+
+        # 3. 45-Minute Body Swing Amplitude (3:15 PM - 4:00 PM ET) -> Hard-rejects wide swings like ORLY
+        body_high = np.maximum(open_p, close)
+        body_low = np.minimum(open_p, close)
+        swing_amplitude_45m = float((body_high.iloc[-23:].max() - body_low.iloc[-23:].min()) / latest_price * 100)
+        if swing_amplitude_45m > MAX_45M_SWING_PCT:
+            return None
+
         sma20_slope = float(abs(sma20.iloc[-1] - sma20.iloc[-15]) / latest_price * 100)
-        if sma20_slope > MAX_20_SLOPE_PCT:
-            return None
-
-        # 3. Continuous Parallel MA Gap (Max gap across ALL last 10 bars <= 0.12%, rejects fast X-crosses)
-        max_10bar_ma_gap = float(ma_dist_pct.iloc[-10:].max())
-        if max_10bar_ma_gap > MAX_PARALLEL_MA_GAP:
-            return None
-
-        # 4. Final 20-Minute Price Box (<= 0.25%, rejects 50-cent rollercoaster drops)
-        closing_box_pct = float((high.iloc[-10:].max() - low.iloc[-10:].min()) / latest_price * 100)
-        if closing_box_pct > MAX_CLOSING_BOX_PCT:
-            return None
-
         price_to_200_gap = float(abs(latest_price - sma200.iloc[-1]) / latest_price * 100)
-        closing_ma_gap = float(ma_dist_pct.iloc[-5:].mean())
 
         # Categorize setup tier
-        is_flat_200 = sma200_slope <= 0.04
-        is_flat_20 = sma20_slope <= 0.04
-        is_pinned_ma = closing_ma_gap <= 0.05
+        is_flat_20 = sma20_slope <= 0.08
+        is_pinned_ma = closing_ma_gap <= 0.06
 
-        if is_flat_200 and is_flat_20 and is_pinned_ma:
+        if is_flat_20 and is_pinned_ma:
             tier_num = 1
-            tier_label = "🔥 Tier 1: Pristine Parallel Squeeze (Best)"
-        elif is_flat_200 and is_pinned_ma:
+            tier_label = "🔥 Tier 1: Perfect Flat 200 & 20 Pin (Best)"
+        elif is_pinned_ma or sma200_slope <= 0.08:
             tier_num = 2
             tier_label = "⚡ Tier 2: Flat 200 Magnet Squeeze (OK)"
         else:
             tier_num = 3
             tier_label = "⏱️ Tier 3: Consolidating Squeeze (OK)"
 
-        score = round((5.0 * sma200_slope) + (4.0 * closing_ma_gap) + (3.0 * price_to_200_gap) + closing_box_pct, 4)
+        squeeze_score = round((5.0 * sma200_slope) + (4.0 * closing_ma_gap) + (2.0 * price_to_200_gap) + swing_amplitude_45m, 4)
 
         return {
             "Ticker": ticker,
@@ -195,10 +188,10 @@ def scan_ticker(ticker):
             "Avg_Volume": int(avg_daily_volume),
             "SMA200_Slope_%": round(sma200_slope, 4),
             "MA_Gap_%": round(closing_ma_gap, 3),
-            "Closing_Box_%": round(closing_box_pct, 3),
+            "Swing_45m_%": round(swing_amplitude_45m, 3),
             "Tier_Num": tier_num,
             "Tier_Label": tier_label,
-            "Score": score,
+            "Score": squeeze_score,
             "df": df
         }
     except Exception as e:
@@ -206,7 +199,7 @@ def scan_ticker(ticker):
 
 def main():
     tickers = get_tickers()
-    send_to_discord(f"🔍 **[{SCRIPT_VERSION}] Scanning {len(tickers)} stocks for True Parallel Squeezes ($50-$400, Vol > 2M)...**")
+    send_to_discord(f"🔍 **[{SCRIPT_VERSION}] Scanning {len(tickers)} stocks for Oliver Velez Narrow States ($50-$400, Vol > 2M)...**")
 
     results = []
     with ThreadPoolExecutor(max_workers=5) as executor:
@@ -218,7 +211,7 @@ def main():
         sorted_results = sorted(results, key=lambda x: (x["Tier_Num"], x["Score"]))
         top_candidates = sorted_results[:TOP_COUNT]
 
-        send_to_discord(f"🎯 **[{SCRIPT_VERSION}] Top {len(top_candidates)} Pristine Narrow State Candidates:**")
+        send_to_discord(f"🎯 **[{SCRIPT_VERSION}] Top {len(top_candidates)} Oliver Velez Candidates:**")
 
         for item in top_candidates:
             chart_file = generate_chart(item['Ticker'], item['df'], item['Tier_Label'])
@@ -230,7 +223,7 @@ def main():
                 except Exception:
                     pass
     else:
-        send_to_discord(f"ℹ️ [{SCRIPT_VERSION}] No stocks met the true parallel squeeze criteria today.")
+        send_to_discord(f"ℹ️ [{SCRIPT_VERSION}] No stocks met the criteria today.")
 
 if __name__ == "__main__":
     main()
