@@ -14,7 +14,7 @@ import yfinance as yf
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
-SCRIPT_VERSION = "v3.1"
+SCRIPT_VERSION = "v3.2"
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
 # --- Scan Settings ---
@@ -22,13 +22,13 @@ MIN_PRICE = 50.0
 MAX_PRICE = 400.0             # Price range $50 - $400
 MIN_DAILY_VOLUME = 2_000_000  # Minimum 2 Million shares average daily volume
 MIN_DAILY_ATR = 1.50          # Minimum Daily ATR of $1.50
-TOP_COUNT = 50                # Return limit updated to 50 candidates
+TOP_COUNT = 50                # Deliver up to 50 candidates
 
-# --- Strict 15-Bar Overlap Squeeze Constraints (v3.1) ---
-MAX_200_SLOPE_PCT = 0.10      # 200 SMA must be flat (max 0.10% slope over last 30 bars)
-MAX_15BAR_MA_GAP = 0.12       # 20 & 200 SMA gap <= 0.12% across entire 15-bar window
-MAX_15BAR_BODY_BOX = 0.32     # Candle body overlap box <= 0.32% across last 15 bars (3:30-4:00 PM)
-MAX_45M_SWING_PCT = 0.40      # Max 0.40% swing amplitude in last 45m (rejects wide swings)
+# --- Calibrated Oliver Velez Squeeze Constraints (v3.2) ---
+MAX_200_SLOPE_PCT = 0.12      # Max 0.12% 200 SMA slope over last 30 bars (allows gentle drift like CSCO)
+MAX_15BAR_MA_GAP = 0.30       # Max 0.30% gap between 20 & 200 SMA (captures CSCO's $0.26 / 0.23% spread)
+MAX_15BAR_BODY_BOX = 0.40     # Max 0.40% candle body box in last 15-20 bars (captures CSCO's 40-cent box)
+MAX_45M_SWING_PCT = 0.50      # Max 0.50% swing amplitude in last 45m (rejects wide rollercoaster waves)
 
 def send_to_discord(caption, photo_path=None):
     if not DISCORD_WEBHOOK_URL:
@@ -99,20 +99,20 @@ def get_tickers():
         df_sp = pd.read_csv(url)
         sp_tickers = df_sp['Symbol'].tolist()
         
-        extra_tickers = ["GOOG", "PLTR", "DIS", "QQQ", "SPY", "IWM", "TSLA", "NVDA", "AMD", "AMZN", "META", "AAPL", "MSFT", "SOFI", "HOOD", "UBER", "ABNB", "COIN", "MARA", "RIOT", "DKNG", "SNAP", "SQ", "SHOP", "RBLX", "PALO"]
+        extra_tickers = ["CSCO", "GOOG", "PLTR", "DIS", "QQQ", "SPY", "IWM", "TSLA", "NVDA", "AMD", "AMZN", "META", "AAPL", "MSFT", "SOFI", "HOOD", "UBER", "ABNB", "COIN", "MARA", "RIOT", "DKNG", "SNAP", "SQ", "SHOP", "RBLX", "PALO"]
         
         all_tickers = list(set(sp_tickers + extra_tickers))
         return [t.replace('.', '-') for t in all_tickers]
     except Exception as e:
         print(f"Error fetching tickers: {e}")
-        return ["GOOG", "PLTR", "DIS", "AMD", "NVDA", "AMZN", "META", "TSLA", "INTC", "PYPL", "QCOM"]
+        return ["CSCO", "GOOG", "PLTR", "DIS", "AMD", "NVDA", "AMZN", "META", "TSLA", "INTC", "PYPL", "QCOM"]
 
 def scan_ticker(ticker):
     try:
         t_obj = yf.Ticker(ticker)
         
-        # 1. Daily ATR Check (>= $1.50)
-        df_daily = t_obj.history(period="1mo", interval="1d")
+        # 1. 14-Day Daily ATR using Welles Wilder Smoothing (matches TradingView ATR Z)
+        df_daily = t_obj.history(period="6mo", interval="1d")
         if df_daily.empty or len(df_daily) < 14:
             return None
             
@@ -120,7 +120,7 @@ def scan_ticker(ticker):
             df_daily['High'] - df_daily['Low'],
             np.maximum(abs(df_daily['High'] - df_daily['Close'].shift(1)), abs(df_daily['Low'] - df_daily['Close'].shift(1)))
         )
-        daily_atr = float(d_tr.rolling(14).mean().iloc[-1])
+        daily_atr = float(d_tr.ewm(alpha=1/14, adjust=False).mean().iloc[-1])
         if daily_atr < MIN_DAILY_ATR:
             return None
 
@@ -146,24 +146,24 @@ def scan_ticker(ticker):
 
         ma_dist_pct = (abs(sma20 - sma200) / close) * 100.0
 
-        # 1. 200 SMA Slope over last 30 bars (Must be flat: <= 0.10%)
+        # 1. 200 SMA Slope over last 30 bars (Must be relatively flat: <= 0.12%)
         sma200_slope = float(abs(sma200.iloc[-1] - sma200.iloc[-30]) / latest_price * 100)
         if sma200_slope > MAX_200_SLOPE_PCT:
             return None
 
-        # 2. 15-Bar Moving Average Gap (Average over last 15 bars: <= 0.12%)
+        # 2. 15-Bar Moving Average Gap (Average over last 15 bars: <= 0.30%, captures CSCO's 0.23% spread)
         ma_gap_15bars = float(ma_dist_pct.iloc[-15:].mean())
         if ma_gap_15bars > MAX_15BAR_MA_GAP:
             return None
 
-        # 3. 15-Bar Candle Body Overlap (Over last 15 bars / 30 mins: <= 0.32%)
+        # 3. 15-Bar Candle Body Overlap (Over last 15 bars / 30 mins: <= 0.40%, captures CSCO's box)
         body_high = np.maximum(open_p, close)
         body_low = np.minimum(open_p, close)
         body_box_15bars = float((body_high.iloc[-15:].max() - body_low.iloc[-15:].min()) / latest_price * 100)
         if body_box_15bars > MAX_15BAR_BODY_BOX:
             return None
 
-        # 4. 45-Minute Body Swing Amplitude (3:15 PM - 4:00 PM ET: <= 0.40%)
+        # 4. 45-Minute Body Swing Amplitude (3:15 PM - 4:00 PM ET: <= 0.50%)
         swing_amplitude_45m = float((body_high.iloc[-23:].max() - body_low.iloc[-23:].min()) / latest_price * 100)
         if swing_amplitude_45m > MAX_45M_SWING_PCT:
             return None
@@ -172,14 +172,14 @@ def scan_ticker(ticker):
         price_to_200_gap = float(abs(latest_price - sma200.iloc[-1]) / latest_price * 100)
 
         # Categorize setup tier
-        is_flat_20 = sma20_slope <= 0.08
-        is_pinned_ma = ma_gap_15bars <= 0.06
-        is_tight_overlap = body_box_15bars <= 0.22
+        is_flat_20 = sma20_slope <= 0.10
+        is_pinned_ma = ma_gap_15bars <= 0.15
+        is_tight_overlap = body_box_15bars <= 0.30
 
         if is_flat_20 and is_pinned_ma and is_tight_overlap:
             tier_num = 1
             tier_label = "🔥 Tier 1: 15-Bar Flat 200 & 20 Pin (Best)"
-        elif is_pinned_ma or sma200_slope <= 0.06:
+        elif is_pinned_ma or sma200_slope <= 0.08:
             tier_num = 2
             tier_label = "⚡ Tier 2: Flat 200 Magnet Squeeze (OK)"
         else:
@@ -206,7 +206,7 @@ def scan_ticker(ticker):
 
 def main():
     tickers = get_tickers()
-    send_to_discord(f"🔍 **[{SCRIPT_VERSION}] Scanning {len(tickers)} stocks for 15-Bar Squeezes (Limit: {TOP_COUNT}, $50-$400)...**")
+    send_to_discord(f"🔍 **[{SCRIPT_VERSION}] Scanning {len(tickers)} stocks for Oliver Velez Narrow States ($50-$400, Vol > 2M)...**")
 
     results = []
     with ThreadPoolExecutor(max_workers=5) as executor:
@@ -218,7 +218,7 @@ def main():
         sorted_results = sorted(results, key=lambda x: (x["Tier_Num"], x["Score"]))
         top_candidates = sorted_results[:TOP_COUNT]
 
-        send_to_discord(f"🎯 **[{SCRIPT_VERSION}] Top {len(top_candidates)} Narrow State Candidates (Up to {TOP_COUNT}):**")
+        send_to_discord(f"🎯 **[{SCRIPT_VERSION}] Found {len(top_candidates)} Narrow State Candidates:**")
 
         for item in top_candidates:
             chart_file = generate_chart(item['Ticker'], item['df'], item['Tier_Label'])
