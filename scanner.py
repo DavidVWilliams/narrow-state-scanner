@@ -1,6 +1,5 @@
 import os
 import json
-import itertools
 import requests
 import pandas as pd
 import numpy as np
@@ -15,22 +14,21 @@ import yfinance as yf
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
-SCRIPT_VERSION = "v7.0"
+SCRIPT_VERSION = "v8.0"
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
-# --- Scan Settings ---
+# --- Scan Settings (v6.0 Foundation) ---
 MIN_PRICE = 50.0
 MAX_PRICE = 400.0             # Price range $50 - $400
 MIN_DAILY_VOLUME = 2_000_000  # Minimum 2 Million shares average daily volume
 MIN_DAILY_ATR = 1.50          # Minimum Daily ATR of $1.50
-TOP_COUNT = 50                # Deliver all qualified candidates
+TOP_COUNT = 50                # Deliver all qualifying candidates
 
-# --- Oliver Velez Strict Narrow State & Anti-Cascade Constraints (v7.0) ---
-MAX_200_SLOPE_30M = 0.10      # 200 SMA must be flat (max 0.10% slope in last 30 bars)
-MAX_20_SLOPE_15M = 0.08       # 20 SMA must be flat (max 0.08% slope, rejects plunging 20 SMAs like V & SO)
-MAX_CLOSING_MA_GAP = 0.20     # Max 0.20% MA gap (captures CSCO, NVDA, TSLA, NFLX; rejects JPM & PG)
-MAX_CLOSING_15M_BOX = 0.30    # Final 15-min price box <= 0.30% (rejects V dump, SO collapse, IWM rally)
-MAX_DIRECTIONAL_STREAK = 4    # Max 4 consecutive same-color bars into close (rejects multi-bar cascades/rallies)
+# --- Inclusive v6.0 Squeeze Constraints ---
+MAX_200_SLOPE_30M = 0.12      # Max 0.12% 200 SMA slope in last 30 bars (captures CSCO, NVDA, TSLA, NFLX)
+MAX_MA_GAP = 0.28             # Max 0.28% gap between 20 & 200 SMA (captures CSCO [0.23%] & NVDA [0.15%])
+MAX_PARALLEL_DRIFT = 0.20     # MAs must be running together
+MAX_PRICE_TO_200_DIST = 0.35  # Price is in vicinity of 200 SMA
 
 def send_to_discord(caption, photo_path=None):
     if not DISCORD_WEBHOOK_URL:
@@ -134,7 +132,6 @@ def scan_ticker(ticker):
         close = df['Close']
         high = df['High']
         low = df['Low']
-        open_p = df['Open']
         volume = df['Volume']
 
         latest_price = float(close.iloc[-1])
@@ -150,54 +147,50 @@ def scan_ticker(ticker):
 
         ma_dist_pct = (abs(sma20 - sma200) / close) * 100.0
 
-        # --- Rule 1: 200 SMA Slope over last 30 bars (Must be flat: <= 0.10%)
+        # --- v6.0 Inclusive Acceptance Filters ---
+        # 1. 200 SMA Slope over last 30 bars (Must be <= 0.12%)
         sma200_slope = float(abs(sma200.iloc[-1] - sma200.iloc[-30]) / latest_price * 100)
         if sma200_slope > MAX_200_SLOPE_30M:
             return None
 
-        # --- Rule 2: 20 SMA Slope over last 15 bars (Must be flat: <= 0.08%, rejects plunging 20 SMAs like V and SO)
-        sma20_slope = float(abs(sma20.iloc[-1] - sma20.iloc[-15]) / latest_price * 100)
-        if sma20_slope > MAX_20_SLOPE_15M:
-            return None
-
-        # --- Rule 3: Moving Average Gap over closing 15 bars (<= 0.20%, rejects JPM)
+        # 2. Moving Average Gap over closing 15 bars (<= 0.28%)
         closing_ma_gap = float(ma_dist_pct.iloc[-15:].mean())
-        if closing_ma_gap > MAX_CLOSING_MA_GAP:
+        if closing_ma_gap > MAX_MA_GAP:
             return None
 
-        # --- Rule 4: Final 15-Minute Price Box (<= 0.30%, rejects late dumps/collapses)
-        closing_15m_box = float((high.iloc[-8:].max() - low.iloc[-8:].min()) / latest_price * 100)
-        if closing_15m_box > MAX_CLOSING_15M_BOX:
+        # 3. Parallel Drift (<= 0.20%)
+        parallel_drift = float(abs(ma_dist_pct.iloc[-1] - ma_dist_pct.iloc[-15]))
+        if parallel_drift > MAX_PARALLEL_DRIFT:
             return None
 
-        # --- Rule 5: Anti-Cascade Streak Check (Rejects multi-bar cascading declines like V & SO, and rallies like IWM)
-        recent_closes = close.iloc[-8:].values
-        diffs = np.diff(recent_closes)
-        is_red = diffs < 0
-        is_green = diffs > 0
-        
-        max_red_streak = max([sum(1 for _ in group) for val, group in itertools.groupby(is_red) if val], default=0)
-        max_green_streak = max([sum(1 for _ in group) for val, group in itertools.groupby(is_green) if val], default=0)
-        
-        if max_red_streak > MAX_DIRECTIONAL_STREAK or max_green_streak > MAX_DIRECTIONAL_STREAK:
+        # 4. Price to 200 SMA distance (<= 0.35%)
+        price_to_200_dist = float(abs(latest_price - sma200.iloc[-1]) / latest_price * 100)
+        if price_to_200_dist > MAX_PRICE_TO_200_DIST:
             return None
+
+        sma20_slope = float(abs(sma20.iloc[-1] - sma20.iloc[-15]) / latest_price * 100)
+
+        # 5. Volatility Compression Metric (Bollinger Bandwidth on 2m candles)
+        bb_std = close.rolling(20).std().iloc[-1]
+        bb_width_pct = (2.0 * bb_std / latest_price) * 100.0
 
         # Tier Classification
-        is_tight_ma = closing_ma_gap <= 0.06
-        is_flat_200 = sma200_slope <= 0.05
-        is_tight_box = closing_15m_box <= 0.20
+        is_tight_ma = closing_ma_gap <= 0.08
+        is_flat_200 = sma200_slope <= 0.06
+        is_compressed = bb_width_pct <= 0.25
 
-        if is_tight_ma and is_flat_200 and is_tight_box:
+        if is_tight_ma and is_flat_200 and is_compressed:
             tier_num = 1
-            tier_label = "🔥 Tier 1: Perfect Flat 200 & 20 Pin (Best)"
-        elif closing_ma_gap <= 0.16:
+            tier_label = "🔥 Tier 1: Parallel Flat Squeeze (Best)"
+        elif closing_ma_gap <= 0.20:
             tier_num = 2
             tier_label = "⚡ Tier 2: Parallel Narrow State Squeeze (OK)"
         else:
             tier_num = 3
             tier_label = "⏱️ Tier 3: Converging Squeeze (OK)"
 
-        squeeze_score = round((4.0 * closing_ma_gap) + (3.0 * sma200_slope) + (2.0 * sma20_slope) + closing_15m_box, 4)
+        # Ranking Score: Heavily penalizes expanding volatility (bb_width) so trending runners drop to bottom
+        squeeze_score = round((4.0 * closing_ma_gap) + (3.0 * sma200_slope) + (2.0 * parallel_drift) + (2.0 * bb_width_pct), 4)
 
         return {
             "Ticker": ticker,
@@ -206,7 +199,7 @@ def scan_ticker(ticker):
             "Avg_Volume": int(avg_daily_volume),
             "SMA200_Slope_%": round(sma200_slope, 4),
             "MA_Gap_%": round(closing_ma_gap, 3),
-            "Closing_15m_Box_%": round(closing_15m_box, 3),
+            "BB_Width_%": round(bb_width_pct, 3),
             "Tier_Num": tier_num,
             "Tier_Label": tier_label,
             "Score": squeeze_score,
@@ -217,7 +210,7 @@ def scan_ticker(ticker):
 
 def main():
     tickers = get_tickers()
-    send_to_discord(f"🔍 **[{SCRIPT_VERSION}] Scanning {len(tickers)} stocks for Oliver Velez Narrow States (Anti-Cascade Active)...**")
+    send_to_discord(f"🔍 **[{SCRIPT_VERSION}] Scanning {len(tickers)} stocks for Oliver Velez Narrow States (v6.0 Foundation + Squeeze Scoring)...**")
 
     results = []
     with ThreadPoolExecutor(max_workers=5) as executor:
@@ -226,10 +219,11 @@ def main():
                 results.append(res)
 
     if results:
+        # Sort by Tier Number then by best Squeeze Score
         sorted_results = sorted(results, key=lambda x: (x["Tier_Num"], x["Score"]))
         top_candidates = sorted_results[:TOP_COUNT]
 
-        send_to_discord(f"🎯 **[{SCRIPT_VERSION}] Found {len(top_candidates)} Oliver Velez Narrow State Candidates:**")
+        send_to_discord(f"🎯 **[{SCRIPT_VERSION}] Found {len(top_candidates)} Narrow State Candidates:**")
 
         for item in top_candidates:
             chart_file = generate_chart(item['Ticker'], item['df'], item['Tier_Label'])
