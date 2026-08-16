@@ -14,19 +14,19 @@ import yfinance as yf
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
-SCRIPT_VERSION = "v8.1"
+SCRIPT_VERSION = "v8.0"
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
-# --- Scan Settings ---
-MIN_PRICE = 35.0              # Price range updated to $35.00
-MAX_PRICE = 350.0             # Price range updated to $350.00
+# --- Scan Settings (v6.0 Foundation) ---
+MIN_PRICE = 50.0
+MAX_PRICE = 400.0             # Price range $50 - $400
 MIN_DAILY_VOLUME = 2_000_000  # Minimum 2 Million shares average daily volume
 MIN_DAILY_ATR = 1.50          # Minimum Daily ATR of $1.50
 TOP_COUNT = 50                # Deliver all qualifying candidates
 
-# --- Version 8 Squeeze Constraints ---
-MAX_200_SLOPE_30M = 0.12      # Max 0.12% 200 SMA slope in last 30 bars
-MAX_MA_GAP = 0.28             # Max 0.28% gap between 20 & 200 SMA
+# --- Inclusive v6.0 Squeeze Constraints ---
+MAX_200_SLOPE_30M = 0.12      # Max 0.12% 200 SMA slope in last 30 bars (captures CSCO, NVDA, TSLA, NFLX)
+MAX_MA_GAP = 0.28             # Max 0.28% gap between 20 & 200 SMA (captures CSCO [0.23%] & NVDA [0.15%])
 MAX_PARALLEL_DRIFT = 0.20     # MAs must be running together
 MAX_PRICE_TO_200_DIST = 0.35  # Price is in vicinity of 200 SMA
 
@@ -147,7 +147,7 @@ def scan_ticker(ticker):
 
         ma_dist_pct = (abs(sma20 - sma200) / close) * 100.0
 
-        # --- v8.0 Acceptance Filters ---
+        # --- v6.0 Inclusive Acceptance Filters ---
         # 1. 200 SMA Slope over last 30 bars (Must be <= 0.12%)
         sma200_slope = float(abs(sma200.iloc[-1] - sma200.iloc[-30]) / latest_price * 100)
         if sma200_slope > MAX_200_SLOPE_30M:
@@ -189,7 +189,7 @@ def scan_ticker(ticker):
             tier_num = 3
             tier_label = "⏱️ Tier 3: Converging Squeeze (OK)"
 
-        # Ranking Score
+        # Ranking Score: Heavily penalizes expanding volatility (bb_width) so trending runners drop to bottom
         squeeze_score = round((4.0 * closing_ma_gap) + (3.0 * sma200_slope) + (2.0 * parallel_drift) + (2.0 * bb_width_pct), 4)
 
         return {
@@ -210,7 +210,7 @@ def scan_ticker(ticker):
 
 def main():
     tickers = get_tickers()
-    send_to_discord(f"🔍 **[{SCRIPT_VERSION}] Scanning {len(tickers)} stocks ($35-$350, Vol > 2M, Daily ATR > $1.50)...**")
+    send_to_discord(f"🔍 **[{SCRIPT_VERSION}] Scanning {len(tickers)} stocks for Oliver Velez Narrow States (v6.0 Foundation + Squeeze Scoring)...**")
 
     results = []
     with ThreadPoolExecutor(max_workers=5) as executor:
@@ -223,7 +223,7 @@ def main():
         sorted_results = sorted(results, key=lambda x: (x["Tier_Num"], x["Score"]))
         top_candidates = sorted_results[:TOP_COUNT]
 
-        send_to_discord(f"🎯 **[{SCRIPT_VERSION}] Found {len(top_candidates)} Narrow State Candidates ($35-$350):**")
+        send_to_discord(f"🎯 **[{SCRIPT_VERSION}] Found {len(top_candidates)} Narrow State Candidates:**")
 
         for item in top_candidates:
             chart_file = generate_chart(item['Ticker'], item['df'], item['Tier_Label'])
