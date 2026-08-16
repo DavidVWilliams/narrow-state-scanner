@@ -14,21 +14,20 @@ import yfinance as yf
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
-SCRIPT_VERSION = "v3.2"
+SCRIPT_VERSION = "v4.0"
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
 # --- Scan Settings ---
 MIN_PRICE = 50.0
 MAX_PRICE = 400.0             # Price range $50 - $400
 MIN_DAILY_VOLUME = 2_000_000  # Minimum 2 Million shares average daily volume
-MIN_DAILY_ATR = 1.50          # Minimum Daily ATR of $1.50
-TOP_COUNT = 50                # Deliver up to 50 candidates
+TOP_COUNT = 50                # Deliver all qualifying candidates
 
-# --- Calibrated Oliver Velez Squeeze Constraints (v3.2) ---
-MAX_200_SLOPE_PCT = 0.12      # Max 0.12% 200 SMA slope over last 30 bars (allows gentle drift like CSCO)
-MAX_15BAR_MA_GAP = 0.30       # Max 0.30% gap between 20 & 200 SMA (captures CSCO's $0.26 / 0.23% spread)
-MAX_15BAR_BODY_BOX = 0.40     # Max 0.40% candle body box in last 15-20 bars (captures CSCO's 40-cent box)
-MAX_45M_SWING_PCT = 0.50      # Max 0.50% swing amplitude in last 45m (rejects wide rollercoaster waves)
+# --- Oliver Velez Core 20/200 SMA Narrow State Criteria ---
+MAX_MA_DISTANCE_PCT = 0.35    # Space between 20 SMA & 200 SMA must be narrow (<= 0.35%)
+MAX_200_SLOPE_PCT = 0.15      # 200 SMA is relatively flat (not a steep vertical trend)
+MAX_20_SLOPE_PCT = 0.15       # 20 SMA is relatively flat (not a steep vertical trend)
+MAX_PRICE_TO_MA_GAP = 0.35    # Price is in the vicinity of the 20/200 SMA band
 
 def send_to_discord(caption, photo_path=None):
     if not DISCORD_WEBHOOK_URL:
@@ -110,27 +109,12 @@ def get_tickers():
 def scan_ticker(ticker):
     try:
         t_obj = yf.Ticker(ticker)
-        
-        # 1. 14-Day Daily ATR using Welles Wilder Smoothing (matches TradingView ATR Z)
-        df_daily = t_obj.history(period="6mo", interval="1d")
-        if df_daily.empty or len(df_daily) < 14:
-            return None
-            
-        d_tr = np.maximum(
-            df_daily['High'] - df_daily['Low'],
-            np.maximum(abs(df_daily['High'] - df_daily['Close'].shift(1)), abs(df_daily['Low'] - df_daily['Close'].shift(1)))
-        )
-        daily_atr = float(d_tr.ewm(alpha=1/14, adjust=False).mean().iloc[-1])
-        if daily_atr < MIN_DAILY_ATR:
-            return None
-
-        # 2. Intraday 2m data (RTH only)
+        # 7-day 2m data during Regular Trading Hours (9:30 AM - 4:00 PM ET)
         df = t_obj.history(period="7d", interval="2m", prepost=False)
         if df.empty or len(df) < 50:
             return None
 
         close = df['Close']
-        open_p = df['Open']
         volume = df['Volume']
 
         latest_price = float(close.iloc[-1])
@@ -141,64 +125,55 @@ def scan_ticker(ticker):
         if avg_daily_volume < MIN_DAILY_VOLUME:
             return None
 
+        # 20 SMA & 200 SMA on 2-minute timeframe
         sma20 = close.rolling(20).mean()
         sma200 = close.rolling(200).mean()
 
         ma_dist_pct = (abs(sma20 - sma200) / close) * 100.0
 
-        # 1. 200 SMA Slope over last 30 bars (Must be relatively flat: <= 0.12%)
+        # 1. Space between 20 SMA and 200 SMA over closing window (last 15 bars)
+        closing_ma_distance = float(ma_dist_pct.iloc[-15:].mean())
+        if closing_ma_distance > MAX_MA_DISTANCE_PCT:
+            return None
+
+        # 2. 200 SMA Slope over last 30 bars (Must be relatively flat, not steep)
         sma200_slope = float(abs(sma200.iloc[-1] - sma200.iloc[-30]) / latest_price * 100)
         if sma200_slope > MAX_200_SLOPE_PCT:
             return None
 
-        # 2. 15-Bar Moving Average Gap (Average over last 15 bars: <= 0.30%, captures CSCO's 0.23% spread)
-        ma_gap_15bars = float(ma_dist_pct.iloc[-15:].mean())
-        if ma_gap_15bars > MAX_15BAR_MA_GAP:
-            return None
-
-        # 3. 15-Bar Candle Body Overlap (Over last 15 bars / 30 mins: <= 0.40%, captures CSCO's box)
-        body_high = np.maximum(open_p, close)
-        body_low = np.minimum(open_p, close)
-        body_box_15bars = float((body_high.iloc[-15:].max() - body_low.iloc[-15:].min()) / latest_price * 100)
-        if body_box_15bars > MAX_15BAR_BODY_BOX:
-            return None
-
-        # 4. 45-Minute Body Swing Amplitude (3:15 PM - 4:00 PM ET: <= 0.50%)
-        swing_amplitude_45m = float((body_high.iloc[-23:].max() - body_low.iloc[-23:].min()) / latest_price * 100)
-        if swing_amplitude_45m > MAX_45M_SWING_PCT:
-            return None
-
+        # 3. 20 SMA Slope over last 15 bars (Must be relatively flat, not steep)
         sma20_slope = float(abs(sma20.iloc[-1] - sma20.iloc[-15]) / latest_price * 100)
-        price_to_200_gap = float(abs(latest_price - sma200.iloc[-1]) / latest_price * 100)
+        if sma20_slope > MAX_20_SLOPE_PCT:
+            return None
 
-        # Categorize setup tier
-        is_flat_20 = sma20_slope <= 0.10
-        is_pinned_ma = ma_gap_15bars <= 0.15
-        is_tight_overlap = body_box_15bars <= 0.30
+        # 4. Price location relative to 200 SMA
+        price_to_200_dist = float(abs(latest_price - sma200.iloc[-1]) / latest_price * 100)
+        if price_to_200_dist > MAX_PRICE_TO_MA_GAP:
+            return None
 
-        if is_flat_20 and is_pinned_ma and is_tight_overlap:
+        # Setup Tier Labeling
+        if closing_ma_distance <= 0.10 and sma200_slope <= 0.06:
             tier_num = 1
-            tier_label = "🔥 Tier 1: 15-Bar Flat 200 & 20 Pin (Best)"
-        elif is_pinned_ma or sma200_slope <= 0.08:
+            tier_label = "🔥 Tight Narrow State (20 & 200 Pin)"
+        elif closing_ma_distance <= 0.20:
             tier_num = 2
-            tier_label = "⚡ Tier 2: Flat 200 Magnet Squeeze (OK)"
+            tier_label = "⚡ Narrow State (Flat/Close 20 & 200)"
         else:
             tier_num = 3
-            tier_label = "⏱️ Tier 3: 15-Bar Consolidation (OK)"
+            tier_label = "⏱️ Converging Narrow State"
 
-        squeeze_score = round((5.0 * sma200_slope) + (4.0 * ma_gap_15bars) + (2.0 * price_to_200_gap) + body_box_15bars, 4)
+        # Narrow State Score (Lower distance = Tighter Squeeze)
+        narrow_score = round(closing_ma_distance + (0.5 * sma200_slope) + (0.5 * sma20_slope), 4)
 
         return {
             "Ticker": ticker,
             "Price": round(latest_price, 2),
-            "Daily_ATR": round(daily_atr, 2),
             "Avg_Volume": int(avg_daily_volume),
+            "MA_Distance_%": round(closing_ma_distance, 3),
             "SMA200_Slope_%": round(sma200_slope, 4),
-            "MA_Gap_15b_%": round(ma_gap_15bars, 3),
-            "Overlap_Box_15b_%": round(body_box_15bars, 3),
             "Tier_Num": tier_num,
             "Tier_Label": tier_label,
-            "Score": squeeze_score,
+            "Score": narrow_score,
             "df": df
         }
     except Exception as e:
@@ -218,11 +193,11 @@ def main():
         sorted_results = sorted(results, key=lambda x: (x["Tier_Num"], x["Score"]))
         top_candidates = sorted_results[:TOP_COUNT]
 
-        send_to_discord(f"🎯 **[{SCRIPT_VERSION}] Found {len(top_candidates)} Narrow State Candidates:**")
+        send_to_discord(f"🎯 **[{SCRIPT_VERSION}] Found {len(top_candidates)} Oliver Velez Narrow State Candidates:**")
 
         for item in top_candidates:
             chart_file = generate_chart(item['Ticker'], item['df'], item['Tier_Label'])
-            caption = f"📊 **{item['Ticker']}** | {item['Tier_Label']} | Price: ${item['Price']} | Daily ATR: ${item['Daily_ATR']} | 15b MA Gap: {item['MA_Gap_15b_%']}% | Vol: {item['Avg_Volume']:,}"
+            caption = f"📊 **{item['Ticker']}** | {item['Tier_Label']} | Price: ${item['Price']} | 20/200 MA Gap: {item['MA_Distance_%']}% | Vol: {item['Avg_Volume']:,}"
             send_to_discord(caption, chart_file)
             if chart_file and os.path.exists(chart_file):
                 try:
