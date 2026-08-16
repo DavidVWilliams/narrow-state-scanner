@@ -14,20 +14,21 @@ import yfinance as yf
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
-SCRIPT_VERSION = "v8.2"
+SCRIPT_VERSION = "v8.1"
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
 # --- Scan Settings ---
-MIN_PRICE = 35.0              # Price range $35 - $350
-MAX_PRICE = 350.0
+MIN_PRICE = 35.0              # Price range updated to $35.00
+MAX_PRICE = 350.0             # Price range updated to $350.00
 MIN_DAILY_VOLUME = 2_000_000  # Minimum 2 Million shares average daily volume
 MIN_DAILY_ATR = 1.50          # Minimum Daily ATR of $1.50
 TOP_COUNT = 50                # Deliver all qualifying candidates
 
-# --- Strict Pinning & Squeeze Constraints (v8.2) ---
-MAX_200_SLOPE_2H = 0.08       # 200 SMA must be flat over last 2 hours (<= 0.08%, rejects IWM [0.16%])
-MAX_MA_GAP = 0.22             # 20 & 200 SMA gap <= 0.22% (captures CSCO [0.18%], NVDA [0.15%], TSLA, NFLX, PLTR, DIS)
-MAX_PRICE_TO_200_DIST = 0.18  # Price must be within 0.18% of 200 SMA at 4:00 PM (Rejects MCD, TGT, IWM, V, SO)
+# --- Version 8 Squeeze Constraints ---
+MAX_200_SLOPE_30M = 0.12      # Max 0.12% 200 SMA slope in last 30 bars
+MAX_MA_GAP = 0.28             # Max 0.28% gap between 20 & 200 SMA
+MAX_PARALLEL_DRIFT = 0.20     # MAs must be running together
+MAX_PRICE_TO_200_DIST = 0.35  # Price is in vicinity of 200 SMA
 
 def send_to_discord(caption, photo_path=None):
     if not DISCORD_WEBHOOK_URL:
@@ -125,10 +126,12 @@ def scan_ticker(ticker):
 
         # 2. Intraday 2m data (RTH only)
         df = t_obj.history(period="7d", interval="2m", prepost=False)
-        if df.empty or len(df) < 60:
+        if df.empty or len(df) < 50:
             return None
 
         close = df['Close']
+        high = df['High']
+        low = df['Low']
         volume = df['Volume']
 
         latest_price = float(close.iloc[-1])
@@ -144,53 +147,59 @@ def scan_ticker(ticker):
 
         ma_dist_pct = (abs(sma20 - sma200) / close) * 100.0
 
-        # --- Rule 1: 2-Hour 200 SMA Flatness (Must be <= 0.08%, Rejects IWM & V multi-hour trends) ---
-        sma200_2h_slope = float(abs(sma200.iloc[-1] - sma200.iloc[-60]) / latest_price * 100)
-        if sma200_2h_slope > MAX_200_SLOPE_2H:
+        # --- v8.0 Acceptance Filters ---
+        # 1. 200 SMA Slope over last 30 bars (Must be <= 0.12%)
+        sma200_slope = float(abs(sma200.iloc[-1] - sma200.iloc[-30]) / latest_price * 100)
+        if sma200_slope > MAX_200_SLOPE_30M:
             return None
 
-        # --- Rule 2: Moving Average Gap at Close (<= 0.22%) ---
+        # 2. Moving Average Gap over closing 15 bars (<= 0.28%)
         closing_ma_gap = float(ma_dist_pct.iloc[-15:].mean())
         if closing_ma_gap > MAX_MA_GAP:
             return None
 
-        # --- Rule 3: 4:00 PM Price Pinning (<= 0.18%, Hard-rejects MCD, TGT, IWM, V, SO multi-bar moves) ---
-        price_to_200_gap = float(abs(latest_price - sma200.iloc[-1]) / latest_price * 100)
-        if price_to_200_gap > MAX_PRICE_TO_200_DIST:
+        # 3. Parallel Drift (<= 0.20%)
+        parallel_drift = float(abs(ma_dist_pct.iloc[-1] - ma_dist_pct.iloc[-15]))
+        if parallel_drift > MAX_PARALLEL_DRIFT:
+            return None
+
+        # 4. Price to 200 SMA distance (<= 0.35%)
+        price_to_200_dist = float(abs(latest_price - sma200.iloc[-1]) / latest_price * 100)
+        if price_to_200_dist > MAX_PRICE_TO_200_DIST:
             return None
 
         sma20_slope = float(abs(sma20.iloc[-1] - sma20.iloc[-15]) / latest_price * 100)
 
-        # Volatility Compression on 2m candles
+        # 5. Volatility Compression Metric (Bollinger Bandwidth on 2m candles)
         bb_std = close.rolling(20).std().iloc[-1]
         bb_width_pct = (2.0 * bb_std / latest_price) * 100.0
 
         # Tier Classification
-        is_tight_ma = closing_ma_gap <= 0.06
-        is_flat_200 = sma200_2h_slope <= 0.04
+        is_tight_ma = closing_ma_gap <= 0.08
+        is_flat_200 = sma200_slope <= 0.06
         is_compressed = bb_width_pct <= 0.25
 
         if is_tight_ma and is_flat_200 and is_compressed:
             tier_num = 1
             tier_label = "🔥 Tier 1: Parallel Flat Squeeze (Best)"
-        elif closing_ma_gap <= 0.16:
+        elif closing_ma_gap <= 0.20:
             tier_num = 2
             tier_label = "⚡ Tier 2: Parallel Narrow State Squeeze (OK)"
         else:
             tier_num = 3
             tier_label = "⏱️ Tier 3: Converging Squeeze (OK)"
 
-        # Squeeze Score
-        squeeze_score = round((5.0 * sma200_2h_slope) + (4.0 * closing_ma_gap) + (3.0 * price_to_200_gap) + bb_width_pct, 4)
+        # Ranking Score
+        squeeze_score = round((4.0 * closing_ma_gap) + (3.0 * sma200_slope) + (2.0 * parallel_drift) + (2.0 * bb_width_pct), 4)
 
         return {
             "Ticker": ticker,
             "Price": round(latest_price, 2),
             "Daily_ATR": round(daily_atr, 2),
             "Avg_Volume": int(avg_daily_volume),
-            "SMA200_2H_Slope_%": round(sma200_2h_slope, 4),
+            "SMA200_Slope_%": round(sma200_slope, 4),
             "MA_Gap_%": round(closing_ma_gap, 3),
-            "Price_200_Gap_%": round(price_to_200_gap, 3),
+            "BB_Width_%": round(bb_width_pct, 3),
             "Tier_Num": tier_num,
             "Tier_Label": tier_label,
             "Score": squeeze_score,
@@ -201,7 +210,7 @@ def scan_ticker(ticker):
 
 def main():
     tickers = get_tickers()
-    send_to_discord(f"🔍 **[{SCRIPT_VERSION}] Scanning {len(tickers)} stocks for Pinned Narrow States ($35-$350, Vol > 2M)...**")
+    send_to_discord(f"🔍 **[{SCRIPT_VERSION}] Scanning {len(tickers)} stocks ($35-$350, Vol > 2M, Daily ATR > $1.50)...**")
 
     results = []
     with ThreadPoolExecutor(max_workers=5) as executor:
@@ -210,14 +219,15 @@ def main():
                 results.append(res)
 
     if results:
+        # Sort by Tier Number then by best Squeeze Score
         sorted_results = sorted(results, key=lambda x: (x["Tier_Num"], x["Score"]))
         top_candidates = sorted_results[:TOP_COUNT]
 
-        send_to_discord(f"🎯 **[{SCRIPT_VERSION}] Found {len(top_candidates)} Pinned Narrow State Candidates:**")
+        send_to_discord(f"🎯 **[{SCRIPT_VERSION}] Found {len(top_candidates)} Narrow State Candidates ($35-$350):**")
 
         for item in top_candidates:
             chart_file = generate_chart(item['Ticker'], item['df'], item['Tier_Label'])
-            caption = f"📊 **{item['Ticker']}** | {item['Tier_Label']} | Price: ${item['Price']} | 2H 200 Slope: {item['SMA200_2H_Slope_%']}% | MA Gap: {item['MA_Gap_%']}% | Vol: {item['Avg_Volume']:,}"
+            caption = f"📊 **{item['Ticker']}** | {item['Tier_Label']} | Price: ${item['Price']} | MA Gap: {item['MA_Gap_%']}% | Vol: {item['Avg_Volume']:,}"
             send_to_discord(caption, chart_file)
             if chart_file and os.path.exists(chart_file):
                 try:
