@@ -14,20 +14,21 @@ import yfinance as yf
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
-SCRIPT_VERSION = "v4.0"
+SCRIPT_VERSION = "v5.0"
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
 # --- Scan Settings ---
 MIN_PRICE = 50.0
 MAX_PRICE = 400.0             # Price range $50 - $400
 MIN_DAILY_VOLUME = 2_000_000  # Minimum 2 Million shares average daily volume
+MIN_DAILY_ATR = 1.50          # Minimum Daily ATR of $1.50
 TOP_COUNT = 50                # Deliver all qualifying candidates
 
-# --- Oliver Velez Core 20/200 SMA Narrow State Criteria ---
-MAX_MA_DISTANCE_PCT = 0.35    # Space between 20 SMA & 200 SMA must be narrow (<= 0.35%)
-MAX_200_SLOPE_PCT = 0.15      # 200 SMA is relatively flat (not a steep vertical trend)
-MAX_20_SLOPE_PCT = 0.15       # 20 SMA is relatively flat (not a steep vertical trend)
-MAX_PRICE_TO_MA_GAP = 0.35    # Price is in the vicinity of the 20/200 SMA band
+# --- Strict Oliver Velez Congestion Constraints (v5.0) ---
+MAX_200_SLOPE_2H = 0.07       # 200 SMA must be flat over last 2 hours (<= 0.07%, rejects V, XOM, IWM, PG)
+MAX_CLOSING_MA_GAP = 0.18     # 20 SMA & 200 SMA gap at close <= 0.18% (captures CSCO & PLTR, rejects PG, TJX, JPM)
+MAX_CONGESTION_BOX_PCT = 0.35 # Final 15-bar price box <= 0.35% (rejects V dump, XOM drop, IBKR swings, TJX breakdown)
+MIN_OVERLAP_RATIO = 0.70      # >= 70% of the last 15 bars must overlap adjacent bars (strictly enforces congestion)
 
 def send_to_discord(caption, photo_path=None):
     if not DISCORD_WEBHOOK_URL:
@@ -109,12 +110,28 @@ def get_tickers():
 def scan_ticker(ticker):
     try:
         t_obj = yf.Ticker(ticker)
-        # 7-day 2m data during Regular Trading Hours (9:30 AM - 4:00 PM ET)
+        
+        # 1. 14-Day Daily ATR using Welles Wilder Smoothing (>= $1.50)
+        df_daily = t_obj.history(period="6mo", interval="1d")
+        if df_daily.empty or len(df_daily) < 14:
+            return None
+            
+        d_tr = np.maximum(
+            df_daily['High'] - df_daily['Low'],
+            np.maximum(abs(df_daily['High'] - df_daily['Close'].shift(1)), abs(df_daily['Low'] - df_daily['Close'].shift(1)))
+        )
+        daily_atr = float(d_tr.ewm(alpha=1/14, adjust=False).mean().iloc[-1])
+        if daily_atr < MIN_DAILY_ATR:
+            return None
+
+        # 2. Intraday 2m data (RTH only)
         df = t_obj.history(period="7d", interval="2m", prepost=False)
-        if df.empty or len(df) < 50:
+        if df.empty or len(df) < 60:
             return None
 
         close = df['Close']
+        high = df['High']
+        low = df['Low']
         volume = df['Volume']
 
         latest_price = float(close.iloc[-1])
@@ -125,55 +142,72 @@ def scan_ticker(ticker):
         if avg_daily_volume < MIN_DAILY_VOLUME:
             return None
 
-        # 20 SMA & 200 SMA on 2-minute timeframe
         sma20 = close.rolling(20).mean()
         sma200 = close.rolling(200).mean()
 
         ma_dist_pct = (abs(sma20 - sma200) / close) * 100.0
 
-        # 1. Space between 20 SMA and 200 SMA over closing window (last 15 bars)
-        closing_ma_distance = float(ma_dist_pct.iloc[-15:].mean())
-        if closing_ma_distance > MAX_MA_DISTANCE_PCT:
+        # --- Rule 1: 200 SMA Flatness over last 60 bars (2:00 PM - 4:00 PM ET) -> Must be <= 0.07%
+        sma200_2h_slope = float(abs(sma200.iloc[-1] - sma200.iloc[-60]) / latest_price * 100)
+        if sma200_2h_slope > MAX_200_SLOPE_2H:
             return None
 
-        # 2. 200 SMA Slope over last 30 bars (Must be relatively flat, not steep)
-        sma200_slope = float(abs(sma200.iloc[-1] - sma200.iloc[-30]) / latest_price * 100)
-        if sma200_slope > MAX_200_SLOPE_PCT:
+        # --- Rule 2: 20 SMA & 200 SMA Gap at close (last 10 bars <= 0.18%)
+        closing_ma_gap = float(ma_dist_pct.iloc[-10:].mean())
+        if closing_ma_gap > MAX_CLOSING_MA_GAP:
             return None
 
-        # 3. 20 SMA Slope over last 15 bars (Must be relatively flat, not steep)
+        # --- Rule 3: 15-Bar Tight Congestion Box (3:30 PM - 4:00 PM ET <= 0.35%)
+        recent_highs = high.iloc[-15:]
+        recent_lows = low.iloc[-15:]
+        congestion_box_pct = float((recent_highs.max() - recent_lows.min()) / latest_price * 100)
+        if congestion_box_pct > MAX_CONGESTION_BOX_PCT:
+            return None
+
+        # --- Rule 4: Consecutive Bar Overlap Check (>= 70% of last 15 bars must overlap adjacent bars)
+        overlap_count = 0
+        for i in range(-14, 0):
+            prev_low, prev_high = low.iloc[i-1], high.iloc[i-1]
+            curr_low, curr_high = low.iloc[i], high.iloc[i]
+            if max(prev_low, curr_low) <= min(prev_high, curr_high):
+                overlap_count += 1
+        
+        overlap_ratio = overlap_count / 14.0
+        if overlap_ratio < MIN_OVERLAP_RATIO:
+            return None
+
         sma20_slope = float(abs(sma20.iloc[-1] - sma20.iloc[-15]) / latest_price * 100)
-        if sma20_slope > MAX_20_SLOPE_PCT:
-            return None
+        price_to_200_gap = float(abs(latest_price - sma200.iloc[-1]) / latest_price * 100)
 
-        # 4. Price location relative to 200 SMA
-        price_to_200_dist = float(abs(latest_price - sma200.iloc[-1]) / latest_price * 100)
-        if price_to_200_dist > MAX_PRICE_TO_MA_GAP:
-            return None
+        # Categorize setup tier
+        is_flat_20 = sma20_slope <= 0.06
+        is_pinned_ma = closing_ma_gap <= 0.08
+        is_tight_box = congestion_box_pct <= 0.25
 
-        # Setup Tier Labeling
-        if closing_ma_distance <= 0.10 and sma200_slope <= 0.06:
+        if is_flat_20 and is_pinned_ma and is_tight_box:
             tier_num = 1
-            tier_label = "🔥 Tight Narrow State (20 & 200 Pin)"
-        elif closing_ma_distance <= 0.20:
+            tier_label = "🔥 Tier 1: Tight Flat Congestion Pin (Best)"
+        elif is_pinned_ma or sma200_2h_slope <= 0.05:
             tier_num = 2
-            tier_label = "⚡ Narrow State (Flat/Close 20 & 200)"
+            tier_label = "⚡ Tier 2: Flat 200 Squeeze Congestion (OK)"
         else:
             tier_num = 3
-            tier_label = "⏱️ Converging Narrow State"
+            tier_label = "⏱️ Tier 3: Consolidating Congestion (OK)"
 
-        # Narrow State Score (Lower distance = Tighter Squeeze)
-        narrow_score = round(closing_ma_distance + (0.5 * sma200_slope) + (0.5 * sma20_slope), 4)
+        score = round((5.0 * sma200_2h_slope) + (4.0 * closing_ma_gap) + (2.0 * price_to_200_gap) + congestion_box_pct, 4)
 
         return {
             "Ticker": ticker,
             "Price": round(latest_price, 2),
+            "Daily_ATR": round(daily_atr, 2),
             "Avg_Volume": int(avg_daily_volume),
-            "MA_Distance_%": round(closing_ma_distance, 3),
-            "SMA200_Slope_%": round(sma200_slope, 4),
+            "SMA200_2H_Slope_%": round(sma200_2h_slope, 4),
+            "MA_Gap_%": round(closing_ma_gap, 3),
+            "Congestion_Box_%": round(congestion_box_pct, 3),
+            "Overlap_%": round(overlap_ratio * 100, 1),
             "Tier_Num": tier_num,
             "Tier_Label": tier_label,
-            "Score": narrow_score,
+            "Score": score,
             "df": df
         }
     except Exception as e:
@@ -181,7 +215,7 @@ def scan_ticker(ticker):
 
 def main():
     tickers = get_tickers()
-    send_to_discord(f"🔍 **[{SCRIPT_VERSION}] Scanning {len(tickers)} stocks for Oliver Velez Narrow States ($50-$400, Vol > 2M)...**")
+    send_to_discord(f"🔍 **[{SCRIPT_VERSION}] Scanning {len(tickers)} stocks for Tight Congestion Zones ($50-$400, Vol > 2M)...**")
 
     results = []
     with ThreadPoolExecutor(max_workers=5) as executor:
@@ -193,11 +227,11 @@ def main():
         sorted_results = sorted(results, key=lambda x: (x["Tier_Num"], x["Score"]))
         top_candidates = sorted_results[:TOP_COUNT]
 
-        send_to_discord(f"🎯 **[{SCRIPT_VERSION}] Found {len(top_candidates)} Oliver Velez Narrow State Candidates:**")
+        send_to_discord(f"🎯 **[{SCRIPT_VERSION}] Found {len(top_candidates)} Tight Congestion Narrow State Candidates:**")
 
         for item in top_candidates:
             chart_file = generate_chart(item['Ticker'], item['df'], item['Tier_Label'])
-            caption = f"📊 **{item['Ticker']}** | {item['Tier_Label']} | Price: ${item['Price']} | 20/200 MA Gap: {item['MA_Distance_%']}% | Vol: {item['Avg_Volume']:,}"
+            caption = f"📊 **{item['Ticker']}** | {item['Tier_Label']} | Price: ${item['Price']} | Box: {item['Congestion_Box_%']}% | Overlap: {item['Overlap_%']}% | Vol: {item['Avg_Volume']:,}"
             send_to_discord(caption, chart_file)
             if chart_file and os.path.exists(chart_file):
                 try:
@@ -205,7 +239,7 @@ def main():
                 except Exception:
                     pass
     else:
-        send_to_discord(f"ℹ️ [{SCRIPT_VERSION}] No stocks met the criteria today.")
+        send_to_discord(f"ℹ️ [{SCRIPT_VERSION}] No stocks met the tight congestion criteria today.")
 
 if __name__ == "__main__":
     main()
