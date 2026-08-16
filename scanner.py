@@ -210,3 +210,16 @@ def main():
         send_to_discord(f"🎯 **[{SCRIPT_VERSION}] Found {len(top_candidates)} True Narrow State Candidates:**")
 
         for item in top_candidates:
+            chart_file = generate_chart(item['Ticker'], item['df'], item['Tier_Label'])
+            caption = f"📊 **{item['Ticker']}** | {item['Tier_Label']} | Price: ${item['Price']} | MA Gap: {item['MA_Gap_%']}% | Vol: {item['Avg_Volume']:,}"
+            send_to_discord(caption, chart_file)
+            if chart_file and os.path.exists(chart_file):
+                try:
+                    os.remove(chart_file)
+                except Exception:
+                    pass
+    else:
+        send_to_discord(f"ℹ️ [{SCRIPT_VERSION}] No stocks met the criteria today.")
+
+if __name__ == "__main__":
+    main()
